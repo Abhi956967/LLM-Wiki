@@ -61,6 +61,21 @@ export interface TocItem {
   level: 2 | 3
 }
 
+function displayHeadingText(text: string): string {
+  return text.trim().toLowerCase() === 'checkpoint' ? 'Quiz' : text
+}
+
+// Older generated lessons wrapped the self-labeling widget in a redundant
+// "Checkpoint" section (often with this stock prompt). Remove only that exact
+// wrapper when it directly introduces a quiz; the fenced source stays byte-for-byte
+// unchanged so persisted question keys remain valid.
+export function stripLegacyQuizWrapper(md: string): string {
+  return md.replace(
+    /^#{2,3}[ \t]+Checkpoint[ \t]*\r?\n(?:[ \t]*\r?\n)*(?:Try to answer without looking back\.[ \t]*\r?\n(?:[ \t]*\r?\n)*)?(?=```quiz[ \t]*(?:\r?\n|$))/gim,
+    '',
+  )
+}
+
 export function extractTocFromMarkdown(md: string): TocItem[] {
   const items: TocItem[] = []
   const lines = md.split('\n')
@@ -69,10 +84,10 @@ export function extractTocFromMarkdown(md: string): TocItem[] {
     const m3 = line.match(/^###\s+(.+)/)
     if (m2) {
       const text = m2[1].replace(/\*\*/g, '').replace(/\[([^\]]+)\]\([^)]*\)/g, '$1').trim()
-      items.push({ id: slugify(text), text, level: 2 })
+      items.push({ id: slugify(text), text: displayHeadingText(text), level: 2 })
     } else if (m3) {
       const text = m3[1].replace(/\*\*/g, '').replace(/\[([^\]]+)\]\([^)]*\)/g, '$1').trim()
-      items.push({ id: slugify(text), text, level: 3 })
+      items.push({ id: slugify(text), text: displayHeadingText(text), level: 3 })
     }
   }
   return items
@@ -586,7 +601,10 @@ export function WikiContent({ content, title, path, documentId = null, onNavigat
   const body = React.useMemo(() => stripFrontmatter(content), [content])
   const description = React.useMemo(() => parseFrontmatterField(content, 'description'), [content])
   const { heading, rest } = React.useMemo(() => extractLeadingH1(body), [body])
-  const processedContent = React.useMemo(() => normalizeMathDelimiters(rest), [rest])
+  const processedContent = React.useMemo(
+    () => normalizeMathDelimiters(stripLegacyQuizWrapper(rest)),
+    [rest],
+  )
   const pageTitle = toDisplayTitle(decodeUnicodeEscapes(heading ?? title))
   const eyebrow = React.useMemo(() => pathEyebrow(path), [path])
   const tocItems = React.useMemo(() => extractTocFromMarkdown(processedContent), [processedContent])
@@ -614,18 +632,20 @@ export function WikiContent({ content, title, path, documentId = null, onNavigat
       h2({ children }) {
         const text = childrenToText(children)
         const id = slugify(text)
+        const displayText = displayHeadingText(text)
         return (
           <h2 id={id} className="text-xl font-semibold tracking-tight mt-6 mb-2 pt-2 border-t border-border/50 first:border-0 first:pt-0 scroll-mt-20">
-            {children}
+            {displayText === text ? children : displayText}
           </h2>
         )
       },
       h3({ children }) {
         const text = childrenToText(children)
         const id = slugify(text)
+        const displayText = displayHeadingText(text)
         return (
           <h3 id={id} className="text-lg font-medium tracking-tight mt-6 mb-1.5 scroll-mt-20">
-            {children}
+            {displayText === text ? children : displayText}
           </h3>
         )
       },

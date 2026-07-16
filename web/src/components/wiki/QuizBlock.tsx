@@ -5,7 +5,7 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
-import { Check, Lightbulb, ListChecks, Loader2, X } from 'lucide-react'
+import { Check, ChevronLeft, ChevronRight, Lightbulb, ListChecks, Loader2, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { apiFetch, isApiError } from '@/lib/api'
 import { Button } from '@/components/ui/button'
@@ -36,13 +36,17 @@ export function QuizBlock({ source, documentId, documentsRef }: QuizBlockProps) 
         <pre className="text-[13px] leading-relaxed bg-muted/60 border border-border rounded-lg p-4 overflow-x-auto">
           {source}
         </pre>
-        <p className="mt-1 text-xs text-muted-foreground/70">Invalid quiz block: {parsed.error}</p>
+        <p role="alert" className="mt-1 text-xs text-muted-foreground/70">
+          Quiz unavailable. Use YAML with a non-empty <code>questions</code> list. Each question needs a{' '}
+          <code>prompt</code> plus either <code>options</code> and a zero-based <code>answer</code>, or{' '}
+          <code>type: text</code> and a <code>rubric</code>.
+        </p>
       </div>
     )
   }
   return (
     <QuizCard
-      key={documentId ?? 'unpersisted'}
+      key={`${documentId ?? 'unpersisted'}:${source}`}
       source={source}
       spec={parsed.spec}
       documentId={documentId}
@@ -63,12 +67,22 @@ function QuizCard({
   documentsRef: React.RefObject<DocumentListItem[] | undefined>
 }) {
   const token = useUserStore((s) => s.accessToken)
+  const questionKeys = React.useMemo(
+    () => spec.questions.map((question, index) => questionKey(source, question, index)),
+    [source, spec.questions],
+  )
   const [completed, setCompleted] = React.useState<Set<string>>(() => {
     if (!documentId) return new Set()
     return new Set(seedCompleted(documentId, storedQuizKeys(documentsRef.current, documentId)))
   })
+  const [activeIndex, setActiveIndex] = React.useState(() => {
+    if (!documentId) return 0
+    const saved = seedCompleted(documentId, storedQuizKeys(documentsRef.current, documentId))
+    const firstIncomplete = questionKeys.findIndex((key) => !saved.has(key))
+    return firstIncomplete === -1 ? questionKeys.length - 1 : firstIncomplete
+  })
 
-  const handleCorrect = React.useCallback(
+  const handleComplete = React.useCallback(
     (key: string) => {
       setCompleted((prev) => new Set(prev).add(key))
       if (!documentId) return
@@ -80,46 +94,59 @@ function QuizCard({
           body: JSON.stringify({ metadata: { quiz: keys } }),
         }),
       ).catch(() => {
-        // Completion survives in session memory; the next correct answer re-sends the full set.
+        // Completion survives in session memory; the next completed answer re-sends the full set.
       })
     },
     [documentId, token],
   )
 
-  const doneCount = spec.questions.filter((q, index) => completed.has(questionKey(source, q, index))).length
+  const doneCount = questionKeys.filter((key) => completed.has(key)).length
+  const activeQuestion = spec.questions[activeIndex]
+  const activeKey = questionKeys[activeIndex]
+  const activeComplete = completed.has(activeKey)
+  const isFirst = activeIndex === 0
+  const isLast = activeIndex === spec.questions.length - 1
 
   return (
     <div
       data-quiz-block
       data-wiki-highlighter
-      className="my-5 rounded-lg border border-border bg-muted/20 overflow-hidden"
+      className="my-5 overflow-hidden rounded-lg border border-border bg-muted/20"
     >
       <div className="flex items-center justify-between gap-3 px-4 py-2.5 border-b border-border/60 bg-muted/40">
         <div className="flex items-center gap-2 min-w-0">
-          <ListChecks className="size-3.5 shrink-0 text-muted-foreground/60" />
+          <ListChecks className="size-3.5 shrink-0 text-muted-foreground/60" aria-hidden="true" />
           <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground/70 truncate">
-            {spec.title ?? 'Checkpoint'}
+            Quiz
           </span>
         </div>
-        {spec.questions.length > 1 && (
-          <span className="text-[11px] tabular-nums text-muted-foreground/60 shrink-0">
-            {doneCount}/{spec.questions.length}
-          </span>
-        )}
+        <span aria-live="polite" className="text-[11px] tabular-nums text-muted-foreground/60 shrink-0">
+          Question {activeIndex + 1} of {spec.questions.length}
+        </span>
       </div>
-      <div className="divide-y divide-border/40">
-        {spec.questions.map((question, index) => {
-          const key = questionKey(source, question, index)
-          return (
-            <QuizQuestionItem
-              key={`${key}-${index}`}
-              question={question}
-              isComplete={completed.has(key)}
-              onCorrect={() => handleCorrect(key)}
-            />
-          )
-        })}
+      <div
+        role="progressbar"
+        aria-label={`${doneCount} of ${spec.questions.length} questions complete`}
+        aria-valuemin={0}
+        aria-valuemax={spec.questions.length}
+        aria-valuenow={doneCount}
+        className="h-px bg-border/40"
+      >
+        <div
+          className="h-full bg-foreground/45 transition-[width] duration-200 motion-reduce:transition-none"
+          style={{ width: `${(doneCount / spec.questions.length) * 100}%` }}
+        />
       </div>
+      <QuizQuestionItem
+        key={`${activeKey}-${activeIndex}`}
+        question={activeQuestion}
+        isComplete={activeComplete}
+        onComplete={() => handleComplete(activeKey)}
+        isFirst={isFirst}
+        isLast={isLast}
+        onPrevious={() => setActiveIndex((index) => Math.max(0, index - 1))}
+        onNext={() => setActiveIndex((index) => Math.min(spec.questions.length - 1, index + 1))}
+      />
     </div>
   )
 }
@@ -127,33 +154,62 @@ function QuizCard({
 function QuizQuestionItem({
   question,
   isComplete,
-  onCorrect,
+  onComplete,
+  isFirst,
+  isLast,
+  onPrevious,
+  onNext,
 }: {
   question: QuizQuestion
   isComplete: boolean
-  onCorrect: () => void
+  onComplete: () => void
+  isFirst: boolean
+  isLast: boolean
+  onPrevious: () => void
+  onNext: () => void
 }) {
   if (question.kind === 'text') {
-    return <TextQuestionItem question={question} isComplete={isComplete} onCorrect={onCorrect} />
+    return (
+      <TextQuestionItem
+        question={question}
+        isComplete={isComplete}
+        onComplete={onComplete}
+        isFirst={isFirst}
+        isLast={isLast}
+        onPrevious={onPrevious}
+        onNext={onNext}
+      />
+    )
   }
-  return <ChoiceQuestionItem question={question} isComplete={isComplete} onCorrect={onCorrect} />
+  return (
+    <>
+      <ChoiceQuestionItem question={question} isComplete={isComplete} onComplete={onComplete} />
+      <QuizFooter
+        isFirst={isFirst}
+        isLast={isLast}
+        isComplete={isComplete}
+        onPrevious={onPrevious}
+        onNext={onNext}
+      />
+    </>
+  )
 }
 
 function ChoiceQuestionItem({
   question,
   isComplete,
-  onCorrect,
+  onComplete,
 }: {
   question: ChoiceQuestion
   isComplete: boolean
-  onCorrect: () => void
+  onComplete: () => void
 }) {
   const [wrongPicks, setWrongPicks] = React.useState<Set<number>>(new Set())
 
   const handlePick = (index: number) => {
     if (isComplete) return
     if (index === question.answer) {
-      onCorrect()
+      onComplete()
       return
     }
     setWrongPicks((prev) => new Set(prev).add(index))
@@ -207,11 +263,19 @@ function ChoiceQuestionItem({
 function TextQuestionItem({
   question,
   isComplete,
-  onCorrect,
+  onComplete,
+  isFirst,
+  isLast,
+  onPrevious,
+  onNext,
 }: {
   question: TextQuestion
   isComplete: boolean
-  onCorrect: () => void
+  onComplete: () => void
+  isFirst: boolean
+  isLast: boolean
+  onPrevious: () => void
+  onNext: () => void
 }) {
   const token = useUserStore((s) => s.accessToken)
   const [answer, setAnswer] = React.useState('')
@@ -237,7 +301,7 @@ function TextQuestionItem({
         body: JSON.stringify({ prompt: question.prompt, rubric: question.rubric, answer: trimmed }),
       })
       setResult(graded)
-      if (graded.verdict === 'correct') onCorrect()
+      if (graded.verdict === 'correct') onComplete()
     } catch (err) {
       if (isApiError(err) && err.status === 501) {
         setSelfCheck(true)
@@ -257,52 +321,139 @@ function TextQuestionItem({
   }
 
   return (
-    <div className="px-4 py-3.5">
-      <QuizMarkdown text={question.prompt} className="font-medium text-foreground/95" />
-      <div className="mt-2.5 space-y-2">
-        {isComplete && !trimmed ? (
-          <div className="flex items-center gap-2 py-1 text-xs text-muted-foreground">
-            <Check className="size-3.5 text-emerald-600 dark:text-emerald-400" aria-hidden="true" />
-            <span>Completed</span>
-          </div>
-        ) : (
-          <Textarea
-            value={answer}
-            onChange={(e) => {
-              setAnswer(e.target.value)
-              setResult(null)
-              setGradeError(null)
-            }}
-            disabled={isComplete || grading}
-            aria-label="Your answer"
-            placeholder="Type your answer…"
-            className="min-h-20 bg-background/60 text-sm"
+    <>
+      <div className="px-4 py-3.5">
+        <QuizMarkdown text={question.prompt} className="font-medium text-foreground/95" />
+        <div className="mt-2.5">
+          {isComplete && !trimmed ? (
+            <div className="flex items-center gap-2 py-1 text-xs text-muted-foreground">
+              <Check className="size-3.5 text-emerald-600 dark:text-emerald-400" aria-hidden="true" />
+              <span>Completed</span>
+            </div>
+          ) : (
+            <Textarea
+              value={answer}
+              onChange={(e) => {
+                setAnswer(e.target.value)
+                setResult(null)
+                setGradeError(null)
+              }}
+              disabled={isComplete || grading}
+              aria-label="Your answer"
+              placeholder="Type your answer…"
+              className="min-h-20 bg-background/60 text-sm"
+            />
+          )}
+          {gradeError && (
+            <p role="status" aria-live="polite" className="mt-2 text-xs text-destructive">
+              {gradeError}
+            </p>
+          )}
+        </div>
+        {result && <GradeFeedback verdict={result.verdict} feedback={result.feedback} />}
+        {!isComplete && selfCheck && revealed && (
+          <SelfCheckPanel
+            question={question}
+            onGotIt={onComplete}
+            onKeepTrying={() => setRevealed(false)}
           />
         )}
-        {!isComplete && (
-          <div className="flex items-center gap-3">
-            <Button size="sm" variant="outline" disabled={!trimmed || grading} onClick={handleCheck}>
-              {grading && <Loader2 className="size-3.5 animate-spin" />}
-              {selfCheck ? 'Compare answer' : result ? 'Check again' : 'Check answer'}
-            </Button>
-            {gradeError && (
-              <span role="status" aria-live="polite" className="text-xs text-destructive">
-                {gradeError}
-              </span>
-            )}
-          </div>
-        )}
+        {!isComplete && <QuizHints hints={question.hints} />}
+        {isComplete && question.explanation && <QuizExplanation text={question.explanation} />}
       </div>
-      {result && <GradeFeedback verdict={result.verdict} feedback={result.feedback} />}
-      {!isComplete && selfCheck && revealed && (
-        <SelfCheckPanel
-          question={question}
-          onGotIt={onCorrect}
-          onKeepTrying={() => setRevealed(false)}
-        />
+      <QuizFooter
+        isFirst={isFirst}
+        isLast={isLast}
+        isComplete={isComplete}
+        onPrevious={onPrevious}
+        onNext={onNext}
+        onCheck={handleCheck}
+        checkLabel={selfCheck ? 'Compare answer' : 'Check answer'}
+        checkDisabled={!trimmed || grading}
+        checking={grading}
+        onAcceptResult={
+          result && result.verdict !== 'correct'
+            ? () => {
+                onComplete()
+                if (!isLast) onNext()
+              }
+            : undefined
+        }
+      />
+    </>
+  )
+}
+
+function QuizFooter({
+  isFirst,
+  isLast,
+  isComplete,
+  onPrevious,
+  onNext,
+  onCheck,
+  onAcceptResult,
+  checkLabel = 'Check answer',
+  checkDisabled = false,
+  checking = false,
+}: {
+  isFirst: boolean
+  isLast: boolean
+  isComplete: boolean
+  onPrevious: () => void
+  onNext: () => void
+  onCheck?: () => void
+  onAcceptResult?: () => void
+  checkLabel?: string
+  checkDisabled?: boolean
+  checking?: boolean
+}) {
+  return (
+    <div
+      data-quiz-footer
+      className="flex min-h-12 items-center justify-between gap-3 border-t border-border/50 px-3 py-2"
+    >
+      <Button
+        type="button"
+        size="sm"
+        variant="ghost"
+        disabled={isFirst || checking}
+        onClick={onPrevious}
+      >
+        <ChevronLeft aria-hidden="true" />
+        Previous
+      </Button>
+      {isLast && isComplete ? (
+        <span className="flex items-center gap-1.5 px-2 text-xs font-medium text-foreground/75">
+          <Check className="size-3.5 text-emerald-600 dark:text-emerald-400" aria-hidden="true" />
+          Quiz complete
+        </span>
+      ) : isComplete ? (
+        <Button type="button" size="sm" variant="outline" onClick={onNext}>
+          Next question
+          <ChevronRight aria-hidden="true" />
+        </Button>
+      ) : onAcceptResult ? (
+        <Button type="button" size="sm" variant="outline" onClick={onAcceptResult}>
+          {isLast ? 'Finish quiz' : 'Next question'}
+          {isLast ? <Check aria-hidden="true" /> : <ChevronRight aria-hidden="true" />}
+        </Button>
+      ) : onCheck ? (
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          disabled={checkDisabled}
+          onClick={onCheck}
+        >
+          {checking && <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />}
+          {checkLabel}
+        </Button>
+      ) : (
+        <Button type="button" size="sm" variant="outline" disabled>
+          Next question
+          <ChevronRight aria-hidden="true" />
+        </Button>
       )}
-      {!isComplete && <QuizHints hints={question.hints} />}
-      {isComplete && question.explanation && <QuizExplanation text={question.explanation} />}
     </div>
   )
 }

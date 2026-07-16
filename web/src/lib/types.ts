@@ -9,6 +9,8 @@ export interface KnowledgeBase {
   created_at: string
   updated_at: string
   kind?: 'wiki' | 'course'
+  lesson_count?: number
+  lessons_completed?: number
 }
 
 export interface Document {

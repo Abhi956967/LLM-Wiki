@@ -7,7 +7,7 @@ register: product
 A local-first knowledge environment where Claude (over MCP) generates and maintains long-form content the user reads, annotates, and progresses through. Two content modes share one engine:
 
 - **Wiki** — a reference graph compiled from the user's own sources. You dip in and out.
-- **Course** — an ordered journey with checkpoints and progress. You work through it.
+- **Course** — an ordered journey with quizzes and progress. You work through it.
 
 Same renderer, same sidebar, same files on disk. "Course" is a *mode*, not a separate app or a forked UI.
 
@@ -17,7 +17,7 @@ Technical, self-directed builders and learners (the primary user builds AI appli
 
 ## Tone
 
-Calm, precise, scholarly. The interface earns trust by disappearing into the task. A quiet study, not a gamified app. Progress is *felt* (rings fill, checkpoints clear) but never *celebrated* (no confetti, XP, mascots, streaks-as-pressure).
+Calm, precise, scholarly. The interface earns trust by disappearing into the task. A quiet study, not a gamified app. Progress is *felt* (rings fill, quizzes clear) but never *celebrated* (no confetti, XP, mascots, streaks-as-pressure).
 
 ## Anti-references
 
@@ -35,13 +35,13 @@ V0 does exactly one thing: **render a course as markdown and make progress legib
 The single most important payoff (the thing chat cannot do): **come back the next day, see what you've read, and resume.** Progress is persisted to lesson frontmatter (`status`) on disk, so it survives across days/sessions/machines — not browser state. That cross-session resume is the core value; everything else serves it.
 
 - In: folder-driven Part/Lesson hierarchy, the rail-as-progress-meter, the reading tracker that checks off sections on scroll, lesson completion, overall + per-Part counts, soft locks, the markdown overview with a resume action, and **code blocks with syntax highlighting** (it's just markdown — for reading PyTorch).
-- Out (phase 2, deliberately deferred): **checkpoints/quizzes**, **highlights/notes**, **executable/graded coding exercises**, and **video embeds**. All valuable; none needed to prove the core. Do not build them in V0.
+- Out (phase 2, deliberately deferred): **quizzes**, **highlights/notes**, **executable/graded coding exercises**, and **video embeds**. All valuable; none needed to prove the core. Do not build them in V0.
 
 ## Strategic principles
 
 1. **Content is the hero; chrome recedes.** The lesson is the loudest thing on screen. Everything else is quiet.
-2. **One engine, two modes.** Wiki and course differ in affordances (progress, checkpoints, completion), not in their visual language. Switching a KB's type must not feel like switching apps.
-3. **Progress is felt, not gamified.** A filling ring and a cleared checkpoint, not points and prizes.
+2. **One engine, two modes.** Wiki and course differ in affordances (progress, quizzes, completion), not in their visual language. Switching a KB's type must not feel like switching apps.
+3. **Progress is felt, not gamified.** A filling ring and a completed quiz, not points and prizes.
 4. **Annotation is first-class.** Highlighting and noting what you read is core, not a bolt-on. It stays subtle: it marks the text, it does not decorate it.
 5. **Claude drives, the UI renders.** State lives in files (frontmatter, `.quiz`, KB metadata); Claude mutates it over MCP; the UI reflects it. The user starting a turn is the trigger; there is no reverse-trigger magic.
 6. **Familiar patterns are features.** Sidebar nav, breadcrumbs, a reading column with a right-rail ToC. Do not invent a second navigation axis (no top tabs over a sidebar) for flavor.

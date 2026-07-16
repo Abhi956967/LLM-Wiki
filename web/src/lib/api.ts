@@ -1,3 +1,6 @@
+import { refreshAccessToken } from '@/lib/auth-token'
+import { useUserStore } from '@/stores/useUserStore'
+
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 const WS_URL = API_URL.replace(/^http/, 'ws')
 const isLocal = process.env.NEXT_PUBLIC_MODE === 'local'
@@ -54,22 +57,44 @@ export async function apiFetch<T>(
 ): Promise<T> {
   const { signal: callerSignal, ...fetchOptions } = options ?? {}
   const timeout = withRequestTimeout(callerSignal, 15000)
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-    ...fetchOptions.headers as Record<string, string>,
-  }
+  const request = (requestToken: string) => {
+    const headers = new Headers(fetchOptions.headers)
+    if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
 
-  // In local mode, skip Authorization header (API doesn't check it)
-  if (!isLocal && token) {
-    headers.Authorization = `Bearer ${token}`
-  }
+    // In local mode, skip Authorization header (API doesn't check it)
+    if (!isLocal && requestToken) {
+      headers.set('Authorization', `Bearer ${requestToken}`)
+    }
 
-  try {
-    const res = await fetch(`${API_URL}${path}`, {
+    return fetch(`${API_URL}${path}`, {
       ...fetchOptions,
       headers,
       signal: timeout.signal,
     })
+  }
+
+  try {
+    // A component may have captured an older token just before Supabase's
+    // TOKEN_REFRESHED event updated the store.
+    let requestToken = token
+    const storedToken = useUserStore.getState().accessToken
+    if (!isLocal && storedToken && storedToken !== requestToken) {
+      requestToken = storedToken
+    }
+
+    let res = await request(requestToken)
+
+    // Tabs can resume before Supabase's background auto-refresh runs. Refresh
+    // once on an actual authentication failure, then replay the request with
+    // the new access token. Authorization failures (403) are not retried.
+    if (!isLocal && res.status === 401) {
+      const refreshedToken = await refreshAccessToken(requestToken).catch(() => null)
+      if (refreshedToken && refreshedToken !== requestToken) {
+        requestToken = refreshedToken
+        res = await request(requestToken)
+      }
+    }
+
     if (!res.ok) {
       const body = await res.json().catch(() => ({}))
       const message =

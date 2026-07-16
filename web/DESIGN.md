@@ -64,12 +64,12 @@ Flat. Structure comes from the two neutral layers (`panel` vs `bg`) and hairline
 - **Course header** — overall progress ring + title; clickable, routes to Overview.
 - **Reading column** — breadcrumb + read-time + status row, title, subtitle, body, right-rail (`On this page` ToC with accent current-item, then `Your notes`).
 - **Completion zone** — a single quiet region under a divider: primary "Mark complete", "Up next" target, `n / total`. Not a heavy card; arms on scroll-to-end.
-- **Quiz card** — numbered, question, answer textarea, "Reveal answer key" gated until typed, answered counter + progress bar, and an MCP grade-handoff strip (neutral border, accent icon only).
+- **Quiz widget** — a compact inline surface labeled "Quiz" that mounts one active question at a time, with quiet position and completion progress plus a stable footer. Choice questions use 2–6 answer buttons; free-form questions use a textarea with Gemma 4 grading or a local self-check fallback. The footer's primary action reads "Check answer" before grading. After any verdict, it changes to "Next question" (or "Finish quiz" on the last item), so feedback never traps the learner in a forced retry. Editing the answer remains the optional retry path, and feedback stays visible until the learner advances.
 - **Module list (Overview)** — a divided list with inline progress bars, never an identical card grid.
-- **Sidebar timeline** — a single rail connects the units of a Part. Each unit is a node (completed/in-progress/locked glyph); the current unit expands to its sub-steps (Lesson, Checkpoint). Part labels are faint uppercase dividers on the rail.
+- **Sidebar timeline** — a single rail connects the units of a Part. Each unit is a node (completed/in-progress/locked glyph); the current unit expands to its sub-steps (Lesson, Quiz). Part labels are faint uppercase dividers on the rail.
 - **Reading progress** — one quiet `ink`-low-opacity hairline fixed at the very top of the content area, driven by scroll position. No label, no section count.
-- **Checkpoint** — rendered inline from an embedded ` ```checkpoint ` fenced block (same mechanism as ` ```mermaid `), one question at a time, with answer textarea, gated "Reveal key", and an MCP grade-handoff line. The block is the definition; answers and scores live in frontmatter/index, never in the block.
-- **Gating** — locks are *soft*: a locked unit is dimmed with a lock icon and a "pass the checkpoint to unlock" hint, but remains clickable. Guidance, not a cage.
+- **Quiz block** — rendered inline from an embedded ` ```quiz ` YAML fence (the same mechanism as ` ```mermaid `). A block contains a non-empty `questions` list of up to 20 choice questions (`prompt`, 2–6 `options`, zero-based `answer`) and/or free-form questions (`type: text`, `prompt`, hidden `rubric`). Optional `hints` and `explanation` fields render Markdown and KaTeX. The app stores completed-question progress; authors never write progress into the block.
+- **Gating** — locks are *soft*: a locked unit is dimmed with a lock icon and a "pass the quiz to unlock" hint, but remains clickable. Guidance, not a cage.
 
 ## Bans (in addition to the shared absolute bans)
 

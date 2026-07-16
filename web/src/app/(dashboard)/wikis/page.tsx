@@ -286,9 +286,17 @@ function WikiCard({
   const [renameName, setRenameName] = React.useState(kb.name)
   const [busy, setBusy] = React.useState(false)
 
+  const lessonCount = kb.lesson_count ?? 0
+  const lessonsCompleted = kb.lessons_completed ?? 0
+  const isCourseWithLessons = kb.kind === 'course' && lessonCount > 0
+
   const stats: string[] = []
   if (kb.source_count > 0) stats.push(`${kb.source_count} source${kb.source_count !== 1 ? 's' : ''}`)
-  if (kb.wiki_page_count > 0) stats.push(`${kb.wiki_page_count} page${kb.wiki_page_count !== 1 ? 's' : ''}`)
+  if (isCourseWithLessons) {
+    stats.push(`${lessonsCompleted}/${lessonCount} lessons`)
+  } else if (kb.wiki_page_count > 0) {
+    stats.push(`${kb.wiki_page_count} page${kb.wiki_page_count !== 1 ? 's' : ''}`)
+  }
 
   const handleRename = async () => {
     const next = renameName.trim()
@@ -335,13 +343,20 @@ function WikiCard({
         className="flex flex-col items-start gap-3 p-5 rounded-xl border border-border bg-card hover:bg-accent/50 transition-colors cursor-pointer text-left group overflow-hidden"
       >
         <div className="flex items-center gap-3 min-w-0 w-full">
-          <div className="flex items-center justify-center w-9 h-9 rounded-lg bg-muted group-hover:bg-accent transition-colors flex-shrink-0">
-            {isOpening ? (
-              <Loader2 size={16} className="animate-spin text-muted-foreground" />
-            ) : (
-              <BookOpen size={16} className="text-muted-foreground group-hover:text-foreground transition-colors" />
-            )}
-          </div>
+          {isCourseWithLessons && !isOpening ? (
+            <ProgressDonut
+              percent={(lessonsCompleted / lessonCount) * 100}
+              label={`${lessonsCompleted} of ${lessonCount} lessons complete`}
+            />
+          ) : (
+            <div className="flex items-center justify-center w-9 h-9 rounded-lg bg-muted group-hover:bg-accent transition-colors flex-shrink-0">
+              {isOpening ? (
+                <Loader2 size={16} className="animate-spin text-muted-foreground" />
+              ) : (
+                <BookOpen size={16} className="text-muted-foreground group-hover:text-foreground transition-colors" />
+              )}
+            </div>
+          )}
           <div className="min-w-0 flex-1">
             <h2 className="text-sm font-medium text-foreground truncate">{kb.name}</h2>
             {kb.description && (
@@ -431,6 +446,48 @@ function WikiCard({
         </DialogContent>
       </Dialog>
     </>
+  )
+}
+
+const DONUT_SIZE = 36
+const DONUT_STROKE = 3.5
+
+function ProgressDonut({ percent, label }: { percent: number; label: string }) {
+  const clamped = Math.min(100, Math.max(0, percent))
+  const radius = (DONUT_SIZE - DONUT_STROKE) / 2
+  const circumference = 2 * Math.PI * radius
+  const complete = clamped >= 100
+  return (
+    <div
+      title={label}
+      className="relative flex items-center justify-center flex-shrink-0"
+      style={{ width: DONUT_SIZE, height: DONUT_SIZE }}
+    >
+      <svg width={DONUT_SIZE} height={DONUT_SIZE} className="-rotate-90">
+        <circle
+          cx={DONUT_SIZE / 2}
+          cy={DONUT_SIZE / 2}
+          r={radius}
+          fill="none"
+          strokeWidth={DONUT_STROKE}
+          className="stroke-border"
+        />
+        <circle
+          cx={DONUT_SIZE / 2}
+          cy={DONUT_SIZE / 2}
+          r={radius}
+          fill="none"
+          strokeWidth={DONUT_STROKE}
+          strokeLinecap="round"
+          strokeDasharray={circumference}
+          strokeDashoffset={circumference * (1 - clamped / 100)}
+          className={`transition-[stroke-dashoffset] duration-500 ${complete ? 'stroke-emerald-500' : 'stroke-foreground'}`}
+        />
+      </svg>
+      <span className={`absolute text-[8px] font-semibold tabular-nums ${complete ? 'text-emerald-600 dark:text-emerald-500' : 'text-foreground'}`}>
+        {Math.round(clamped)}%
+      </span>
+    </div>
   )
 }
 

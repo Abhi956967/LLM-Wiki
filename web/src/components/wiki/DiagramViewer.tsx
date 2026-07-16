@@ -2,6 +2,7 @@
 
 import * as React from 'react'
 import { X, ZoomIn, ZoomOut, Maximize2 } from 'lucide-react'
+import { useTheme } from 'next-themes'
 
 const MIN_SCALE = 0.25
 const MAX_SCALE = 5
@@ -14,20 +15,35 @@ interface DiagramViewerProps {
   onClose: () => void
 }
 
-function buildSrcdoc(content: string, type: 'svg' | 'img', alt?: string): string {
+type DiagramTheme = 'light' | 'dark'
+
+const CANVAS_BACKGROUND: Record<DiagramTheme, string> = {
+  light: 'hsl(30 3% 96%)',
+  dark: 'hsl(20 14% 4%)',
+}
+
+function buildSrcdoc(
+  content: string,
+  type: 'svg' | 'img',
+  theme: DiagramTheme,
+  alt?: string,
+): string {
   const body = type === 'svg'
     ? content
     : `<img src="${content}" alt="${alt || ''}" style="max-width:100%;height:auto" />`
 
   return `<!DOCTYPE html>
 <html><head><style>
-  html, body { margin: 0; padding: 0; overflow: hidden; display: flex; align-items: center; justify-content: center; width: 100%; height: 100%; background: transparent; }
+  html { color-scheme: ${theme}; }
+  html, body { margin: 0; padding: 0; overflow: hidden; display: flex; align-items: center; justify-content: center; width: 100%; height: 100%; background: ${CANVAS_BACKGROUND[theme]}; }
   svg { max-width: none; height: auto; }
   img { max-width: none; height: auto; }
 </style></head><body>${body}</body></html>`
 }
 
 export function DiagramViewer({ content, type, alt, onClose }: DiagramViewerProps) {
+  const { resolvedTheme } = useTheme()
+  const diagramTheme: DiagramTheme = resolvedTheme === 'dark' ? 'dark' : 'light'
   const [scale, setScale] = React.useState(1.25)
   const [translate, setTranslate] = React.useState({ x: 0, y: 0 })
   const dragging = React.useRef(false)
@@ -72,7 +88,10 @@ export function DiagramViewer({ content, type, alt, onClose }: DiagramViewerProp
     return () => window.removeEventListener('keydown', handleKey)
   }, [onClose])
 
-  const srcdoc = React.useMemo(() => buildSrcdoc(content, type, alt), [content, type, alt])
+  const srcdoc = React.useMemo(
+    () => buildSrcdoc(content, type, diagramTheme, alt),
+    [content, type, diagramTheme, alt],
+  )
 
   return (
     <div className="fixed inset-0 z-50 bg-background/90 backdrop-blur-sm flex flex-col">
@@ -96,7 +115,7 @@ export function DiagramViewer({ content, type, alt, onClose }: DiagramViewerProp
 
       {/* Canvas */}
       <div
-        className="flex-1 overflow-hidden cursor-grab active:cursor-grabbing"
+        className="flex-1 overflow-hidden cursor-grab active:cursor-grabbing bg-background"
         onWheel={handleWheel}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
@@ -113,7 +132,7 @@ export function DiagramViewer({ content, type, alt, onClose }: DiagramViewerProp
             srcDoc={srcdoc}
             sandbox="allow-same-origin"
             title={alt || 'Diagram'}
-            className="border-none bg-transparent pointer-events-none"
+            className="border-none bg-background pointer-events-none"
             style={{ width: '80vw', height: '80vh' }}
           />
         </div>

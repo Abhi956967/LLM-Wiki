@@ -8,6 +8,7 @@ import { Upload as UploadIcon, BookOpen, ArrowUpRight, Loader2, PlugZap } from '
 import { useUserStore, useUploadStore } from '@/stores'
 import { useKBDocuments } from '@/hooks/useKBDocuments'
 import { apiFetch } from '@/lib/api'
+import { refreshAccessToken } from '@/lib/auth-token'
 import { toast } from 'sonner'
 import { KBSidenav } from '@/components/kb/KBSidenav'
 import { openMcpConnectionDock } from '@/components/connections/McpConnectionDock'
@@ -618,6 +619,7 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
   const tusUploadFile = React.useCallback(async (file: File, targetPath: string = '/'): Promise<void> => {
     const t = getToken()
     if (!t) return Promise.reject(new Error('Not authenticated'))
+    const uploadToken = await refreshAccessToken(t).catch(() => null) ?? t
     const uploadId = crypto.randomUUID()
     addUpload({ id: uploadId, filename: file.name, kbId, kbSlug, path: targetPath })
     const { Upload } = await import('tus-js-client')
@@ -626,7 +628,13 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
         endpoint: `${API_URL}/v1/uploads`,
         retryDelays: [0, 1000, 3000, 5000],
         metadata: { filename: file.name, knowledge_base_id: kbId, path: targetPath },
-        headers: { Authorization: `Bearer ${t}` },
+        headers: { Authorization: `Bearer ${uploadToken}` },
+        onBeforeRequest: (request) => {
+          // Long-running uploads span multiple TUS requests. Supabase can
+          // rotate the access token between chunks, so read it at send time.
+          const latestToken = useUserStore.getState().accessToken ?? uploadToken
+          request.setHeader('Authorization', `Bearer ${latestToken}`)
+        },
         onProgress: (sent, total) => setUploadProgress(uploadId, total > 0 ? sent / total : 0),
         onError: (error) => { markUploadFailed(uploadId); reject(error) },
         onSuccess: () => { markUploadProcessing(uploadId); resolve() },
