@@ -94,7 +94,7 @@ Paste the printed JSON into `claude_desktop_config.json` (Claude Desktop) or `.c
 
 A routine prompt that works well:
 
-> *Read the guide. Find everything added to the workspace since your last run — new sources, clips, and highlights. For each one, read it and update the wiki: write new pages where they're warranted, fold new material into existing pages, and fix any cross-references or citations it affects. Append a short note to `wiki/log.md` summarizing what changed.*
+> *Read the guide. Find everything added to the workspace since your last run — new sources, clips, and highlights. For each one, read it and update the wiki: write new pages where they're warranted, fold new material into existing pages, and fix any cross-references or citations it affects.*
 
 Then schedule that prompt to run nightly. [Claude Code Routines](https://code.claude.com/docs/en/routines) run it on Anthropic's cloud on a fixed cadence even when your laptop is closed — create one at [claude.ai/code/routines](https://claude.ai/code/routines), with `/schedule` in the CLI, or from Claude Cowork — while a [Desktop scheduled task](https://code.claude.com/docs/en/desktop-scheduled-tasks) runs the same prompt on your own machine. Either way the wiki compounds: a year from now you can open it and read back the ideas you were working through a year ago.
 
@@ -132,7 +132,6 @@ LLM Wiki adds exactly two things to the folder you point it at. Your source file
   data.xlsx
   wiki/                      # generated pages — created by LLM Wiki
     overview.md
-    log.md
     concepts/
       attention.md
   .llmwiki/                  # index + cache — hidden, rebuildable
@@ -152,14 +151,14 @@ Once connected over MCP, Claude works the wiki through a small, deliberate set o
 | Tool | What it does |
 |------|--------------|
 | `guide` | Orients Claude — how the vault works and which knowledge bases exist. It calls this first. |
-| `create_knowledge_base` | Creates a knowledge base and starter wiki pages (`overview.md`, `log.md`); local mode returns the existing singleton workspace. |
+| `create_knowledge_base` | Creates a knowledge base and starter `overview.md`; local mode returns the existing singleton workspace. |
 | `list_knowledge_bases` | Lists your knowledge bases and their slugs (every other tool takes one). |
 | `search` | Browse files, full-text search across content, or query the citation graph — what cites what, plus stale or uncited pages. |
 | `read` | Read documents — a single file or a glob batch, PDF/office page ranges, optionally with embedded images. |
 | `create` | Create a wiki page, note, or asset (SVG diagram, CSV) with footnote citations back to sources. |
 | `edit` | Find-and-replace exact text in an existing page. |
 | `append` | Add content to the end of a page. |
-| `delete` | Remove pages or sources by path or glob (`overview.md` and `log.md` are protected). |
+| `delete` | Remove pages or sources by path or glob (`overview.md` and any legacy `log.md` are protected). |
 | `lint` | Deterministic hygiene checks — citation resolution, dangling links, orphan and stale pages, frontmatter consistency. |
 
 Writes go to the source of truth first — a file on disk in local mode, Postgres in hosted mode — then the search index updates. So when Claude creates `/wiki/concepts/attention.md`, it's a real file (or row) immediately, not a pending change.

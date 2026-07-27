@@ -1,6 +1,23 @@
 import { defineConfig } from "wxt";
+import packageJson from "./package.json";
 
-const apiOrigin = new URL(process.env.VITE_API_BASE_URL ?? "https://api.llmwiki.app").origin;
+function requiredEnv(name: string): string {
+  const value = process.env[name]?.trim();
+  if (!value) {
+    throw new Error(`${name} must be set before building the extension`);
+  }
+  return value;
+}
+
+function origin(name: string, value: string): string {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error();
+    return url.origin;
+  } catch {
+    throw new Error(`${name} must be an absolute HTTP(S) URL`);
+  }
+}
 
 export default defineConfig({
   srcDir: "src",
@@ -25,27 +42,45 @@ export default defineConfig({
     keepProfileChanges: true,
     startUrls: ["https://example.com/"],
   },
-  manifest: {
-    name: "LLM Wiki",
-    description: "Save any web page or PDF to your LLM Wiki knowledge base",
-    version: "0.1.0",
-    minimum_chrome_version: "109",
-    permissions: ["activeTab", "identity", "offscreen", "storage", "scripting"],
-    // The page is reached via activeTab on the toolbar click; host_permissions
-    // is only the API origin so the extension can call its own backend.
-    host_permissions: [`${apiOrigin}/*`, "http://localhost/*"],
-    icons: {
-      16: "icon/16.png",
-      32: "icon/32.png",
-      48: "icon/48.png",
-      96: "icon/96.png",
-      128: "icon/128.png",
-    },
-    action: {
-      default_icon: {
+  // WXT loads dotenv after importing this config file, so resolve environment
+  // values lazily. Evaluating them at module load silently ignored .env.
+  manifest: () => {
+    const apiOrigin = origin(
+      "VITE_API_BASE_URL",
+      process.env.VITE_API_BASE_URL ?? "https://api.llmwiki.app",
+    );
+    const supabaseOrigin = origin(
+      "VITE_SUPABASE_URL",
+      requiredEnv("VITE_SUPABASE_URL"),
+    );
+    requiredEnv("VITE_SUPABASE_ANON_KEY");
+
+    return {
+      name: "LLM Wiki",
+      description: "Save any web page or PDF to your LLM Wiki knowledge base",
+      version: packageJson.version,
+      minimum_chrome_version: "109",
+      permissions: ["activeTab", "identity", "offscreen", "storage", "scripting"],
+      // activeTab covers the page itself. Explicit host access is still needed
+      // for cross-origin API and Supabase Auth requests from extension pages.
+      host_permissions: [
+        `${apiOrigin}/*`,
+        `${supabaseOrigin}/*`,
+        "http://localhost/*",
+      ],
+      icons: {
         16: "icon/16.png",
         32: "icon/32.png",
+        48: "icon/48.png",
+        96: "icon/96.png",
+        128: "icon/128.png",
       },
-    },
+      action: {
+        default_icon: {
+          16: "icon/16.png",
+          32: "icon/32.png",
+        },
+      },
+    };
   },
 });

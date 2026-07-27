@@ -45,18 +45,7 @@ This wiki tracks research on {name}. No sources have been ingested yet.
 
 ## Key Findings
 
-No sources ingested yet - add your first source to get started.
-
-## Recent Updates
-
-No activity yet.\
-"""
-
-_LOG_TEMPLATE = """\
-Chronological record of ingests, queries, and maintenance passes.
-
-## [{date}] created | Wiki Created
-- Initialized wiki: {name}\
+No sources ingested yet - add your first source to get started.\
 """
 
 
@@ -687,13 +676,4 @@ class PostgresVaultFS(VaultFS):
             ["overview", "wiki"],
             date=today,
             metadata={"description": f"Research hub for {name}."},
-        )
-        await self.create_document(
-            kb_id,
-            "log.md",
-            "Log",
-            "/wiki/",
-            "md",
-            _LOG_TEMPLATE.format(name=name, date=today),
-            ["log"],
         )

@@ -1,11 +1,14 @@
 """Binary extraction pipeline in local_processor: claim guard, PDF, Office, Mistral."""
 
+import asyncio
 import sys
+import threading
 import types
 import uuid
 from pathlib import Path
 
 import aiosqlite
+import pytest
 
 
 def _stub_pdf_extract(monkeypatch, extract_fn) -> None:
@@ -137,6 +140,115 @@ async def test_processing_doc_is_not_reclaimed(tmp_path, monkeypatch):
     await db.close()
 
 
+async def test_cancelled_processing_is_restored_to_pending(tmp_path, monkeypatch):
+    """Shutdown cancellation after a claim must not strand a processing row."""
+    import domain.local_processor as processor
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    db = await _init_db(workspace)
+
+    (workspace / "paper.pdf").write_bytes(b"%PDF-1.4 fake")
+    doc_id = await _insert_doc(
+        db, filename="paper.pdf", file_type="pdf", relative_path="paper.pdf",
+    )
+    extraction_started = asyncio.Event()
+
+    async def stalled_extraction(*args, **kwargs):
+        extraction_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(processor, "_process_pdf", stalled_extraction)
+    task = asyncio.create_task(processor.process_document(db, doc_id, workspace))
+    await asyncio.wait_for(extraction_started.wait(), timeout=1)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    row = await _doc_row(db, doc_id)
+    assert row["status"] == "pending"
+    assert row["error_message"] is None
+
+    await db.close()
+
+
+async def test_isolated_cancellation_joins_worker_before_status_and_cleanup(
+    tmp_path,
+    monkeypatch,
+):
+    """A cancelled extraction keeps its claim/resources until its thread exits."""
+    import domain.local_processor as processor
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    db = await _init_db(workspace)
+    (workspace / "paper.pdf").write_bytes(b"%PDF-1.4 fake")
+    doc_id = await _insert_doc(
+        db, filename="paper.pdf", file_type="pdf", relative_path="paper.pdf",
+    )
+
+    worker_started = threading.Event()
+    worker_release = threading.Event()
+
+    def blocked_extract(path: str):
+        worker_started.set()
+        if not worker_release.wait(timeout=5):
+            raise TimeoutError("test worker was never released")
+        return _pdf_fixture()
+
+    _stub_pdf_extract(monkeypatch, blocked_extract)
+    semaphore = asyncio.Semaphore(1)
+    monkeypatch.setattr(processor, "_process_semaphore", semaphore)
+
+    connection_closed = asyncio.Event()
+    original_create_pool = processor.create_pool
+
+    class TrackingConnection:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        async def close(self):
+            await self._inner.close()
+            connection_closed.set()
+
+    async def tracking_create_pool(*args, **kwargs):
+        inner = await original_create_pool(*args, **kwargs)
+        return TrackingConnection(inner)
+
+    monkeypatch.setattr(processor, "create_pool", tracking_create_pool)
+    task = asyncio.create_task(processor.process_document_isolated(workspace, doc_id))
+    started = await asyncio.wait_for(
+        asyncio.get_running_loop().run_in_executor(None, worker_started.wait, 1),
+        timeout=2,
+    )
+    assert started is True
+
+    task.cancel()
+    await asyncio.sleep(0)
+    try:
+        row = await _doc_row(db, doc_id)
+        assert row["status"] == "processing"
+        assert semaphore.locked()
+        assert not connection_closed.is_set()
+        assert not task.done()
+    finally:
+        worker_release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=2)
+
+    row = await _doc_row(db, doc_id)
+    assert row["status"] == "pending"
+    assert not semaphore.locked()
+    assert connection_closed.is_set()
+
+    await db.close()
+
+
 async def test_missing_file_marks_failed(tmp_path):
     from domain.local_processor import process_document
 
@@ -180,6 +292,41 @@ async def test_office_without_libreoffice_marks_failed(tmp_path, monkeypatch):
     assert await _chunk_count(db, doc_id) == 0
 
     await db.close()
+
+
+def test_office_timeout_kills_conversion_process_group(monkeypatch):
+    import domain.local_processor as lp
+
+    killed: list[tuple[int, int]] = []
+
+    class StalledProcess:
+        pid = 9812
+        returncode = None
+
+        def communicate(self, timeout):
+            raise lp.subprocess.TimeoutExpired("libreoffice", timeout)
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self):
+            self.returncode = -9
+            return self.returncode
+
+    process = StalledProcess()
+    monkeypatch.setattr(lp.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(lp.os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(
+        lp.os,
+        "killpg",
+        lambda process_group, sig: killed.append((process_group, sig)),
+    )
+
+    with pytest.raises(TimeoutError, match="timed out"):
+        lp._run_process_group(["libreoffice", "source.docx"], timeout=1)
+
+    assert killed == [(process.pid, lp.signal.SIGKILL)]
+    assert process.returncode == -9
 
 
 async def test_pdf_mistral_backend_stores_pages(tmp_path, monkeypatch):

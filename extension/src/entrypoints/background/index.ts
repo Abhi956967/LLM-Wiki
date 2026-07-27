@@ -9,7 +9,7 @@ import {
   type GetPdfSaveStatusMessage,
   type StartPdfSaveMessage,
 } from "@/lib/pdf-save-jobs";
-import type { AuthChangeEvent, Session } from "@supabase/auth-js";
+import { API_READ_TIMEOUT_MS, API_WRITE_TIMEOUT_MS, runWithDeadline } from "@/lib/deadline";
 
 type BackgroundMessage =
   | { type: "SIGN_IN_WITH_GOOGLE" }
@@ -24,6 +24,7 @@ type BackgroundMessage =
       method?: string;
       headers?: Record<string, string>;
       body?: string;
+      timeoutMs?: number;
     };
 
 type Message = BackgroundMessage | StartPdfSaveMessage | GetPdfSaveStatusMessage;
@@ -37,8 +38,6 @@ interface ApiFetchResponse {
 
 export default defineBackground(() => {
   const supabase = getSupabase();
-
-  supabase.auth.onAuthStateChange((_event: AuthChangeEvent, _session: Session | null) => {});
 
   chrome.runtime.onMessage.addListener(
     (message: Message, sender, sendResponse) => {
@@ -96,27 +95,35 @@ export default defineBackground(() => {
       method?: string;
       headers?: Record<string, string>;
       body?: string;
+      timeoutMs?: number;
     },
   ): Promise<ApiFetchResponse> {
     try {
       if (!isAllowedApiFetchUrl(msg.url, await getApiUrl())) {
         return { ok: false, status: 403, error: "Blocked extension fetch target" };
       }
-      const res = await fetch(msg.url, {
-        method: msg.method ?? "GET",
-        headers: msg.headers,
-        body: msg.body,
-      });
-      let data: unknown = null;
-      const text = await res.text();
-      if (text) {
-        try {
-          data = JSON.parse(text);
-        } catch {
-          data = text;
+      const requestedTimeout = Number.isFinite(msg.timeoutMs)
+        ? Number(msg.timeoutMs)
+        : API_READ_TIMEOUT_MS;
+      const timeoutMs = Math.min(Math.max(requestedTimeout, 1_000), API_WRITE_TIMEOUT_MS);
+      return await runWithDeadline(async (signal) => {
+        const res = await fetch(msg.url, {
+          method: msg.method ?? "GET",
+          headers: msg.headers,
+          body: msg.body,
+          signal,
+        });
+        let data: unknown = null;
+        const text = await res.text();
+        if (text) {
+          try {
+            data = JSON.parse(text);
+          } catch {
+            data = text;
+          }
         }
-      }
-      return { ok: res.ok, status: res.status, data };
+        return { ok: res.ok, status: res.status, data };
+      }, timeoutMs, `API request timed out after ${Math.ceil(timeoutMs / 1_000)} seconds`);
     } catch (err) {
       const message = err instanceof Error ? err.message : "Network error";
       return { ok: false, status: 0, error: message };

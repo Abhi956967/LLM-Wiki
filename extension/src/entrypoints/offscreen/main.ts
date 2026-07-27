@@ -8,6 +8,7 @@ import {
   type StartPdfSaveMessage,
 } from "@/lib/pdf-save-jobs";
 import type { SaveResult } from "@/lib/api";
+import { runtimeMessageWithDeadline } from "@/lib/deadline";
 
 const jobs = new Map<string, PdfSaveJobStatus>();
 const activeSaves = new Map<string, Promise<SaveResult>>();
@@ -91,7 +92,11 @@ function scheduleCleanup(delay: number): void {
     }
     jobs.clear();
     closing = true;
-    void chrome.runtime.sendMessage({ type: CLOSE_PDF_SAVE_CONTEXT }).catch(() => {
+    void runtimeMessageWithDeadline(
+      { type: CLOSE_PDF_SAVE_CONTEXT },
+      5_000,
+      "The background did not close the PDF save context",
+    ).catch(() => {
       // If shutdown failed, continue serving jobs in this still-live context.
       closing = false;
     });

@@ -115,3 +115,99 @@ async def test_reconcile_backfills_chunks_for_indexed_text(tmp_path):
     assert await _chunk_count(db, doc_id) == chunks_after_first
 
     await db.close()
+
+
+async def test_reconcile_recovers_interrupted_processing_with_stale_chunks(tmp_path):
+    """A hard exit can leave processing + old chunks; startup must retry it."""
+    from domain.local_processor import reconcile_workspace
+
+    workspace = tmp_path / "research"
+    workspace.mkdir()
+    db = await _init_db(workspace)
+    html = (
+        "<html><body><h1>Recovered Document</h1><p>"
+        + ("Interruption recovery makes extraction retryable. " * 25)
+        + "</p></body></html>"
+    )
+    doc_id = await _insert_indexed_html(db, workspace, html)
+    await db.execute(
+        "UPDATE documents SET status = 'processing', parser = 'webmd', content = 'stale', "
+        "updated_at = datetime('now', '-1 minute') "
+        "WHERE id = ?",
+        (doc_id,),
+    )
+    await db.execute(
+        "INSERT INTO document_chunks "
+        "(id, document_id, chunk_index, content, source_content, token_count) "
+        "VALUES (?, ?, 0, 'stale chunk', 'stale chunk', 2)",
+        (str(uuid.uuid4()), doc_id),
+    )
+    await db.commit()
+
+    await reconcile_workspace(db, workspace)
+
+    cursor = await db.execute(
+        "SELECT status, parser, content FROM documents WHERE id = ?",
+        (doc_id,),
+    )
+    status, parser, content = await cursor.fetchone()
+    assert status == "ready"
+    assert parser == "webmd"
+    assert "Interruption recovery" in content
+    assert await _fts_hits(db, "retryable") > 0
+    assert await _fts_hits(db, "stale") == 0
+
+    await db.close()
+
+
+async def test_interrupted_recovery_does_not_reclaim_post_cutoff_work(tmp_path):
+    from domain.local_processor import _recover_interrupted_documents
+
+    workspace = tmp_path / "research"
+    workspace.mkdir()
+    db = await _init_db(workspace)
+    doc_id = await _insert_indexed_html(db, workspace, "<p>Active extraction</p>")
+    await db.execute(
+        "UPDATE documents SET status = 'processing', updated_at = '2029-12-31 23:59:59' "
+        "WHERE id = ?",
+        (doc_id,),
+    )
+    await db.commit()
+
+    recovered = await _recover_interrupted_documents(
+        db,
+        "2029-12-31 23:59:59",
+    )
+
+    cursor = await db.execute("SELECT status FROM documents WHERE id = ?", (doc_id,))
+    assert recovered == []
+    assert (await cursor.fetchone())[0] == "processing"
+
+    await db.close()
+
+
+async def test_reconcile_finalizes_pending_image(tmp_path):
+    from domain.local_processor import reconcile_workspace
+
+    workspace = tmp_path / "research"
+    workspace.mkdir()
+    (workspace / "diagram.png").write_bytes(b"not-decoded-by-native-handler")
+    db = await _init_db(workspace)
+    doc_id = str(uuid.uuid4())
+    await db.execute(
+        "INSERT INTO documents (id, user_id, filename, title, path, relative_path, "
+        "source_kind, file_type, status, tags, version, document_number) "
+        "VALUES (?, ?, 'diagram.png', 'Diagram', '/', 'diagram.png', 'source', "
+        "'png', 'pending', '[]', 0, 3)",
+        (doc_id, USER_ID),
+    )
+    await db.commit()
+
+    await reconcile_workspace(db, workspace)
+
+    cursor = await db.execute(
+        "SELECT status, parser, page_count FROM documents WHERE id = ?",
+        (doc_id,),
+    )
+    assert await cursor.fetchone() == ("ready", "native", 1)
+    await db.close()

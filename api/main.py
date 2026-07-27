@@ -41,6 +41,7 @@ if settings.LOGFIRE_TOKEN:
 from routes.health import router as health_router
 from routes.knowledge_bases import router as knowledge_bases_router
 from routes.documents import router as documents_router
+from routes.events import router as events_router
 from routes.me import router as me_router
 from routes.usage import router as usage_router
 
@@ -210,16 +211,20 @@ if settings.MODE != "local":
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
     app.add_middleware(SlowAPIMiddleware)
 
+local_extension_origin_regex = None
+if settings.MODE == "local":
+    from infra.local_http import LocalHTTPBoundaryMiddleware, extension_origin_regex
+
+    local_extension_origin_regex = extension_origin_regex(
+        settings.local_extension_origins,
+    )
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.APP_URL],
     # Local clipping may be initiated by the popup or extension background
     # worker. Hosted mode keeps its existing, web-app-only CORS policy.
-    allow_origin_regex=(
-        r"(?:chrome-extension|moz-extension)://[A-Za-z0-9._-]+"
-        if settings.MODE == "local"
-        else None
-    ),
+    allow_origin_regex=local_extension_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -237,9 +242,11 @@ app.add_middleware(
 if settings.MODE == "local":
     # This is deliberately outside CORS so Host validation also covers
     # preflights. Local mode has no auth and supports loopback binding only.
-    from infra.local_http import LocalHTTPBoundaryMiddleware
-
-    app.add_middleware(LocalHTTPBoundaryMiddleware, app_origin=settings.APP_URL)
+    app.add_middleware(
+        LocalHTTPBoundaryMiddleware,
+        app_origin=settings.APP_URL,
+        extension_origins=settings.local_extension_origins,
+    )
 
 if settings.LOGFIRE_TOKEN:
     import logfire
@@ -250,6 +257,7 @@ app.include_router(me_router)
 app.include_router(usage_router)
 app.include_router(knowledge_bases_router)
 app.include_router(documents_router)
+app.include_router(events_router)
 
 if settings.MODE == "local":
     from routes.local_upload import router as local_upload_router

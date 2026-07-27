@@ -30,6 +30,7 @@ jobs:
       - name: Run API unit tests
         run: >-
           PYTHONPATH=api pytest
+          tests/unit/test_api_quiz_validation.py
           tests/unit/test_chunker.py
           tests/unit/test_helpers.py
           tests/unit/test_pdf_extract.py
@@ -39,12 +40,20 @@ jobs:
           tests/unit/test_preserve_replies.py
           tests/unit/test_auth_refresh_limits.py
           tests/unit/test_auth_provider_invariant.py
+          tests/unit/test_deps_lifecycle.py
           tests/unit/test_hosted_parser_isolation.py
           tests/unit/test_local_http_boundary.py
+          tests/unit/test_local_events.py
+          tests/unit/test_local_processor_extraction.py
+          tests/unit/test_local_reconcile.py
+          tests/unit/test_local_upload_streaming.py
           tests/unit/test_text_content_limits.py
           tests/unit/test_upload_hardening.py
+          tests/unit/test_url_ingest.py
+          tests/unit/test_watcher_paths.py
           tests/unit/test_quiz_grader.py
           tests/integration/test_converter_isolation.py
+          tests/integration/test_converter_service.py
           -v
 
       - name: Run MCP unit tests
@@ -98,8 +107,15 @@ jobs:
         run: npm test
 
   extension:
-    name: Extension tests (tsc + vitest)
+    name: Extension tests and package validation
     runs-on: ubuntu-latest
+    env:
+      # CI validates packaging with intentionally non-production public config;
+      # it does not publish this archive. Release verification rejects these.
+      PACKAGE_VALIDATION_MODE: test
+      VITE_API_BASE_URL: https://api.llmwiki.app
+      VITE_SUPABASE_URL: https://ci-placeholder.supabase.co
+      VITE_SUPABASE_ANON_KEY: ci-placeholder-anon-key
 
     steps:
       - uses: actions/checkout@v4
@@ -126,6 +142,18 @@ jobs:
       - name: Run vitest
         working-directory: extension
         run: npm test
+
+      - name: Build extension
+        working-directory: extension
+        run: npm run build
+
+      - name: Create test package
+        working-directory: extension
+        run: npm run zip
+
+      - name: Validate release package
+        working-directory: extension
+        run: npm run verify:package
 
   postgres-integration:
     name: Integration tests (Postgres)
@@ -166,6 +194,7 @@ jobs:
         run: >-
           PYTHONPATH=api MODE=hosted pytest
           tests/integration/isolation/
+          tests/integration/test_events.py
           tests/integration/test_kb_lifecycle.py
           tests/integration/test_note_lifecycle.py
           tests/integration/test_text_quota_accounting.py

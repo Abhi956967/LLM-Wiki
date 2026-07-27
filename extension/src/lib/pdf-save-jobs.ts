@@ -1,5 +1,6 @@
 import type { SaveResult } from "./api";
 import type { SavePdfFromTabRequest } from "./pdf-save";
+import { withDeadline } from "./deadline";
 
 export const ENSURE_PDF_SAVE_CONTEXT = "ENSURE_PDF_SAVE_CONTEXT";
 export const START_PDF_SAVE = "START_PDF_SAVE";
@@ -27,12 +28,21 @@ export interface PdfSaveJobClientDependencies {
   sendMessage(message: unknown): Promise<unknown>;
   wait(milliseconds: number): Promise<void>;
   createJobId(): string;
+  now?(): number;
+  messageTimeoutMs?: number;
+  jobTimeoutMs?: number;
 }
+
+export const PDF_JOB_TIMEOUT_MS = 15 * 60_000;
+const PDF_JOB_MESSAGE_TIMEOUT_MS = 10_000;
 
 const defaultDependencies: PdfSaveJobClientDependencies = {
   sendMessage: (message) => chrome.runtime.sendMessage(message),
   wait: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
   createJobId: () => crypto.randomUUID(),
+  now: () => Date.now(),
+  messageTimeoutMs: PDF_JOB_MESSAGE_TIMEOUT_MS,
+  jobTimeoutMs: PDF_JOB_TIMEOUT_MS,
 };
 
 /**
@@ -43,7 +53,17 @@ export async function runPdfSaveJob(
   request: SavePdfFromTabRequest,
   dependencies: PdfSaveJobClientDependencies = defaultDependencies,
 ): Promise<SaveResult> {
-  const ready = await dependencies.sendMessage({ type: ENSURE_PDF_SAVE_CONTEXT }) as {
+  const now = dependencies.now ?? (() => Date.now());
+  const messageTimeoutMs = dependencies.messageTimeoutMs ?? PDF_JOB_MESSAGE_TIMEOUT_MS;
+  const jobTimeoutMs = dependencies.jobTimeoutMs ?? PDF_JOB_TIMEOUT_MS;
+  const sendMessage = (message: unknown) => withDeadline(
+    dependencies.sendMessage(message),
+    messageTimeoutMs,
+    "The PDF save context did not respond",
+  );
+  const deadlineAt = now() + jobTimeoutMs;
+
+  const ready = await sendMessage({ type: ENSURE_PDF_SAVE_CONTEXT }) as {
     ready?: boolean;
     error?: string;
   } | undefined;
@@ -60,13 +80,13 @@ export async function runPdfSaveJob(
   for (let attempt = 0; attempt < 10 && !accepted; attempt += 1) {
     if (attempt > 0) {
       try {
-        await dependencies.sendMessage({ type: ENSURE_PDF_SAVE_CONTEXT });
+        await sendMessage({ type: ENSURE_PDF_SAVE_CONTEXT });
       } catch {
         // The previous context may be finishing its idle shutdown.
       }
     }
     try {
-      const response = await dependencies.sendMessage(startMessage) as {
+      const response = await sendMessage(startMessage) as {
         accepted?: boolean;
       } | undefined;
       accepted = response?.accepted === true;
@@ -78,11 +98,12 @@ export async function runPdfSaveJob(
   if (!accepted) throw new Error("PDF save context did not become ready");
 
   let missingPolls = 0;
-  while (true) {
+  while (now() < deadlineAt) {
     await dependencies.wait(250);
+    if (now() >= deadlineAt) break;
     let status: PdfSaveJobStatus | undefined;
     try {
-      status = await dependencies.sendMessage({
+      status = await sendMessage({
         type: GET_PDF_SAVE_STATUS,
         jobId,
       } satisfies GetPdfSaveStatusMessage) as PdfSaveJobStatus | undefined;
@@ -100,4 +121,6 @@ export async function runPdfSaveJob(
     if (status.state === "error") throw new Error(status.error);
     return status.result;
   }
+  const minutes = Math.max(1, Math.ceil(jobTimeoutMs / 60_000));
+  throw new Error(`PDF save timed out after ${minutes} minute${minutes === 1 ? "" : "s"}`);
 }

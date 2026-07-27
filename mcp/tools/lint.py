@@ -22,9 +22,9 @@ from .write import (
 _FOOTNOTE_DEF_RE = re.compile(r"^\[\^([^\]]+)\]:\s*(.+)$", re.MULTILINE)
 _FOOTNOTE_USE_RE = re.compile(r"\[\^([^\]]+)\](?!:)")
 _SOURCE_EXT_RE = re.compile(r"\.(pdf|docx?|pptx?|xlsx?|csv|html?|md|txt)$", re.IGNORECASE)
-_ROOT_PAGES = frozenset({"/wiki/overview.md", "/wiki/index.md", "/wiki/readme.md", "/wiki/log.md"})
-# Append-only chronological ledgers — frontmatter/footnote conventions don't apply.
-_LEDGER_PAGES = frozenset({"/wiki/log.md"})
+_ROOT_PAGES = frozenset({"/wiki/overview.md", "/wiki/index.md", "/wiki/readme.md", "/wiki/log.md", "/wiki/plan.md"})
+# Append-only chronological ledgers and checklists — frontmatter/footnote conventions don't apply.
+_LEDGER_PAGES = frozenset({"/wiki/log.md", "/wiki/plan.md"})
 _MATCH_ALL_PATHS = frozenset({"*", "**", "**/*"})
 _MAX_ISSUES_PER_GROUP = 40
 

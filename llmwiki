@@ -67,7 +67,7 @@ def cmd_init(workspace: str) -> None:
         (ws_id, ws_name, user_id),
     )
 
-    # Scaffold wiki pages
+    # Scaffold the wiki overview. Activity is captured in knowledge_base_events.
     doc1_id = str(uuid.uuid4())
     conn.execute(
         "INSERT INTO documents (id, user_id, filename, title, path, relative_path, source_kind, "
@@ -75,16 +75,7 @@ def cmd_init(workspace: str) -> None:
         "VALUES (?, ?, 'overview.md', 'Overview', '/wiki/', 'wiki/overview.md', 'wiki', "
         "'md', 'ready', ?, '[]', 0, 1)",
         (doc1_id, user_id,
-         f"This wiki tracks research on {ws_name}.\n\n## Key Findings\n\nNo sources ingested yet.\n\n## Recent Updates\n\nNo activity yet."),
-    )
-
-    doc2_id = str(uuid.uuid4())
-    conn.execute(
-        "INSERT INTO documents (id, user_id, filename, title, path, relative_path, source_kind, "
-        "file_type, status, content, tags, version, document_number) "
-        "VALUES (?, ?, 'log.md', 'Log', '/wiki/', 'wiki/log.md', 'wiki', "
-        "'md', 'ready', ?, '[]', 0, 2)",
-        (doc2_id, user_id, "Chronological record of ingests, queries, and maintenance passes."),
+         f"This wiki tracks research on {ws_name}.\n\n## Key Findings\n\nNo sources ingested yet."),
     )
 
     conn.commit()
@@ -95,15 +86,7 @@ def cmd_init(workspace: str) -> None:
     if not overview.exists():
         overview.write_text(
             f"This wiki tracks research on {ws_name}.\n\n"
-            "## Key Findings\n\nNo sources ingested yet.\n\n"
-            "## Recent Updates\n\nNo activity yet.\n",
-            encoding="utf-8",
-        )
-
-    log = ws / "wiki" / "log.md"
-    if not log.exists():
-        log.write_text(
-            "Chronological record of ingests, queries, and maintenance passes.\n",
+            "## Key Findings\n\nNo sources ingested yet.\n",
             encoding="utf-8",
         )
 
@@ -112,7 +95,6 @@ def cmd_init(workspace: str) -> None:
 
     print(f"✓ Initialized workspace: {ws}")
     print(f"  wiki/overview.md — created")
-    print(f"  wiki/log.md — created")
     print(f"  .llmwiki/index.db — created")
 
 

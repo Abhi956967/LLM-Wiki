@@ -1,7 +1,7 @@
 'use client'
 
 import * as React from 'react'
-import { useSearchParams } from 'next/navigation'
+import { useRouter, useSearchParams } from 'next/navigation'
 import dynamic from 'next/dynamic'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Upload as UploadIcon, BookOpen, ArrowUpRight, Loader2, PlugZap } from 'lucide-react'
@@ -131,6 +131,7 @@ type Props = {
 }
 
 export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Props) {
+  const router = useRouter()
   const searchParams = useSearchParams()
   const token = useUserStore((s) => s.accessToken)
   const userId = useUserStore((s) => s.user?.id)
@@ -829,6 +830,8 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
             graphViewActive={graphViewActive}
             onGraphToggle={handleGraphToggle}
             onOpenSourceDoc={handleOpenSourceDoc}
+            recentActive={false}
+            onRecentSelect={() => router.push(`/wikis/${kbSlug}`)}
           />
         </div>
         <div className="flex-1 min-w-0">

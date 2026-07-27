@@ -1,5 +1,6 @@
 import { AuthClient, type GoTrueClient } from "@supabase/auth-js";
 import { SUPABASE_URL, SUPABASE_ANON_KEY } from "./constants";
+import { AUTH_REQUEST_TIMEOUT_MS, runWithDeadline } from "./deadline";
 
 /**
  * Custom storage adapter for Manifest V3 — service workers have no localStorage.
@@ -24,6 +25,13 @@ interface SupabaseAuthClient {
 
 let _client: SupabaseAuthClient | null = null;
 
+const timedAuthFetch: typeof fetch = (input, init) => runWithDeadline(
+  (signal) => fetch(input, { ...init, signal }),
+  AUTH_REQUEST_TIMEOUT_MS,
+  "Authentication request timed out",
+  init?.signal,
+);
+
 export function getSupabase(): SupabaseAuthClient {
   if (!_client) {
     _client = {
@@ -38,6 +46,7 @@ export function getSupabase(): SupabaseAuthClient {
         autoRefreshToken: true,
         persistSession: true,
         detectSessionInUrl: false,
+        fetch: timedAuthFetch,
       }),
     };
   }

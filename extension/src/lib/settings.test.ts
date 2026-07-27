@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   isBuiltInDisabledHost,
+  normalizeHost,
   normalizeApiUrl,
   normalizeFolderPath,
 } from "./settings";
@@ -44,6 +45,13 @@ describe("extension settings helpers", () => {
       expect(isBuiltInDisabledHost("notllmwiki.app")).toBe(false);
       expect(isBuiltInDisabledHost("llmwiki.app.evil.com")).toBe(false);
       expect(isBuiltInDisabledHost("llmwiki-app.com")).toBe(false);
+    });
+  });
+
+  describe("normalizeHost", () => {
+    it("uses the same canonical host for popup labels and content-script checks", () => {
+      expect(normalizeHost(" www.Example.com. ")).toBe("example.com");
+      expect(normalizeHost("example.com")).toBe("example.com");
     });
   });
 });

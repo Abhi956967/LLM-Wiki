@@ -9,6 +9,8 @@ import {
   Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
 } from '@/components/ui/dialog'
 import { KBSidenav } from '@/components/kb/KBSidenav'
+import { PlanProgress } from '@/components/kb/PlanProgress'
+import { RecentChanges } from '@/components/kb/RecentChanges'
 import { openMcpConnectionDock } from '@/components/connections/McpConnectionDock'
 import { WikiContent } from '@/components/wiki/WikiContent'
 import { useKBDocuments } from '@/hooks/useKBDocuments'
@@ -19,6 +21,7 @@ import {
   enrichTreeWithProgress, findCurrentLesson, flattenLessons, flattenPages, lessonStatus,
 } from '@/lib/wikiTree'
 import { isOwnWrite } from '@/lib/highlights/ownWrites'
+import { parsePlanTasks, type PlanSummary } from '@/lib/planTasks'
 import { useCourseProgress } from '@/hooks/useCourseProgress'
 
 const isLocal = process.env.NEXT_PUBLIC_MODE === 'local'
@@ -77,6 +80,8 @@ function buildTreeFromDocs(docs: DocumentListItem[]): WikiNode[] {
     const sa = slug(a), sb = slug(b)
     if (sa === 'overview') return -1
     if (sb === 'overview') return 1
+    if (sa === 'plan') return -1
+    if (sb === 'plan') return 1
     if (sa === 'log') return 1
     if (sb === 'log') return -1
     return a.title.localeCompare(b.title)
@@ -186,10 +191,25 @@ export function WikiOnlyDetail({
     if (urlWikiDocNumber === handledUrlDocNumberRef.current) return
     if (new URL(window.location.href).searchParams.get('p') !== String(urlWikiDocNumber)) return
     const doc = documents.find((d) => d.document_number === urlWikiDocNumber)
-    if (!doc) return
+    if (!doc) {
+      if (!courseMode) {
+        handledUrlDocNumberRef.current = null
+        setWikiActivePath(null)
+        updateParam('p', null)
+      }
+      return
+    }
     handledUrlDocNumberRef.current = urlWikiDocNumber
     setWikiActivePath((doc.path + doc.filename).replace(/^\/wiki\/?/, ''))
-  }, [urlWikiDocNumber, documents])
+  }, [courseMode, documents, updateParam, urlWikiDocNumber])
+
+  // Browser back/forward can return from a page deep link to the wiki root.
+  React.useEffect(() => {
+    if (courseMode || urlWikiDocNumber != null) return
+    if (new URL(window.location.href).searchParams.has('p')) return
+    handledUrlDocNumberRef.current = null
+    setWikiActivePath(null)
+  }, [courseMode, urlWikiDocNumber])
 
   const indexDoc = wikiDocs.find((d) => d.filename === 'index.json' && d.path === '/wiki/')
   const scaffoldFiles = React.useMemo(() => new Set(['index.json', 'overview.md', 'log.md']), [])
@@ -234,20 +254,42 @@ export function WikiOnlyDetail({
     return () => { cancelled = true }
   }, [indexDoc?.id, indexDoc?.version, token, wikiTreeFingerprint])
 
+  const planDoc = React.useMemo(
+    () => wikiDocs.find((d) => d.path === '/wiki/' && d.filename === 'plan.md') ?? null,
+    [wikiDocs],
+  )
+  const [planSummary, setPlanSummary] = React.useState<PlanSummary | null>(null)
+
+  React.useEffect(() => {
+    if (courseMode || !planDoc || !token) {
+      setPlanSummary(null)
+      return
+    }
+    let cancelled = false
+    apiFetch<{ content: string }>(`/v1/documents/${planDoc.id}/content`, token)
+      .then((res) => {
+        if (!cancelled) setPlanSummary(parsePlanTasks(res.content || ''))
+      })
+      .catch(() => {
+        if (!cancelled) setPlanSummary(null)
+      })
+    return () => { cancelled = true }
+  }, [courseMode, planDoc?.id, planDoc?.version, token])
+
   const prunedTree = React.useMemo(
     () => (loading ? wikiTree : pruneMissingPages(wikiTree, wikiPathSet)),
     [loading, wikiTree, wikiPathSet],
   )
 
   React.useEffect(() => {
-    if (indexLoaded && !wikiActivePath && urlWikiDocNumber == null && prunedTree.length && !loading) {
+    if (courseMode && indexLoaded && !wikiActivePath && urlWikiDocNumber == null && prunedTree.length && !loading) {
       const first = findFirstPath(prunedTree)
       if (first) {
         setWikiActivePath(first.path)
         if (first.docNumber != null) updateParam('p', String(first.docNumber))
       }
     }
-  }, [indexLoaded, prunedTree, wikiActivePath, urlWikiDocNumber, loading, updateParam])
+  }, [courseMode, indexLoaded, prunedTree, wikiActivePath, urlWikiDocNumber, loading, updateParam])
 
   const [pageContent, setPageContent] = React.useState('')
   const [pageTitle, setPageTitle] = React.useState('')
@@ -371,6 +413,12 @@ export function WikiOnlyDetail({
     }
   }, [updateParam, wikiDocs])
 
+  const handleRecentSelect = React.useCallback(() => {
+    handledUrlDocNumberRef.current = null
+    setWikiActivePath(null)
+    updateParam('p', null, 'push')
+  }, [updateParam])
+
   // Advancing completes the lesson being read (locks are a progression cue, not
   // enforcement — a deep-linked read still counts) and moves to the next.
   const handleForward = React.useCallback(() => {
@@ -446,8 +494,21 @@ export function WikiOnlyDetail({
 
   const showMainLoading =
     loading ||
-    (hasNavigableWiki && !wikiActivePath) ||
+    (courseMode && hasNavigableWiki && !wikiActivePath) ||
     (!!wikiActivePath && pageLoadedPath !== wikiActivePath)
+
+  const activityRefreshKey = React.useMemo(
+    () => documents.map((document) => [
+      document.id,
+      document.version,
+      document.status,
+      document.archived,
+      document.title,
+      document.path,
+      document.filename,
+    ].join(':')).join('|'),
+    [documents],
+  )
 
   return (
     <div className="flex h-full flex-col">
@@ -471,6 +532,8 @@ export function WikiOnlyDetail({
               const doc = documents.find((d) => d.id === docId)
               if (doc) openSourceDoc(doc)
             }}
+            recentActive={!courseMode && wikiActivePath == null}
+            onRecentSelect={courseMode ? undefined : handleRecentSelect}
             courseMode={courseMode}
             courseCurrentPath={currentLessonPath}
             courseProgress={courseMode ? { completed: completedCount, total: lessons.length } : undefined}
@@ -481,6 +544,21 @@ export function WikiOnlyDetail({
             <div className="flex h-full items-center justify-center">
               <Loader2 className="size-5 animate-spin text-muted-foreground" />
             </div>
+          ) : !courseMode && !wikiActivePath ? (
+            <RecentChanges
+              kbId={kbId}
+              kbSlug={kbSlug}
+              kbName={kbName}
+              documents={documents}
+              refreshKey={activityRefreshKey}
+              onWikiNavigate={handleWikiSelect}
+              planSlot={planSummary && planSummary.total > 0 ? (
+                <PlanProgress
+                  summary={planSummary}
+                  onOpen={() => handleWikiSelect('plan.md', planDoc?.document_number ?? null)}
+                />
+              ) : null}
+            />
           ) : hasNavigableWiki && wikiActivePath ? (
             <WikiContent
               content={pageContent}

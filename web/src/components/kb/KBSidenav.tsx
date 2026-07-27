@@ -5,8 +5,8 @@ import { motion, AnimatePresence } from 'framer-motion'
 import {
   ChevronRight, FileText, NotepadText, Library,
   Upload, BookOpen, ArrowUpRight, Search as SearchIcon,
-  Lightbulb, Box, ScrollText, Network, Folder, Check, Lock, Plug,
-  PanelLeftClose, PanelLeftOpen,
+  Lightbulb, Box, ScrollText, Network, Folder, Check, ListChecks, Lock, Plug,
+  PanelLeftClose, PanelLeftOpen, History,
 } from 'lucide-react'
 import {
   CommandDialog, CommandInput, CommandList, CommandItem,
@@ -38,6 +38,20 @@ function toDisplayTitle(title: string): string {
   return title.replace(/\b\w/g, (c) => c.toUpperCase())
 }
 
+function withoutLegacyActivityPages(nodes: WikiNode[]): WikiNode[] {
+  const result: WikiNode[] = []
+  for (const node of nodes) {
+    const children = node.children ? withoutLegacyActivityPages(node.children) : undefined
+    const normalizedPath = node.path?.replace(/^\/wiki\/?/, '')
+    if (normalizedPath === 'log.md' || normalizedPath === 'index.json') {
+      if (children?.length) result.push({ ...node, path: undefined, docNumber: null, children })
+      continue
+    }
+    result.push({ ...node, children })
+  }
+  return result
+}
+
 
 interface KBSidenavProps {
   kbId: string
@@ -54,6 +68,8 @@ interface KBSidenavProps {
   graphViewActive: boolean
   onGraphToggle: () => void
   onOpenSourceDoc: (docId: string) => void
+  recentActive?: boolean
+  onRecentSelect?: () => void
   courseMode?: boolean
   courseCurrentPath?: string | null
   courseProgress?: { completed: number; total: number }
@@ -74,6 +90,8 @@ export function KBSidenav({
   graphViewActive,
   onGraphToggle,
   onOpenSourceDoc,
+  recentActive = false,
+  onRecentSelect,
   courseMode = false,
   courseCurrentPath = null,
   courseProgress,
@@ -106,6 +124,8 @@ export function KBSidenav({
     typeof navigator !== 'undefined' && /Mac|iPod|iPhone|iPad/.test(navigator.userAgent),
   [])
 
+  const visibleWikiTree = React.useMemo(() => withoutLegacyActivityPages(wikiTree), [wikiTree])
+
   const allSearchableItems = React.useMemo(() => {
     const items: { type: 'wiki' | 'source'; title: string; keywords: string; tags: string[]; path?: string; docNumber?: number | null; doc?: DocumentListItem }[] = []
     const addWikiNodes = (nodes: WikiNode[], parentPath = '') => {
@@ -125,7 +145,7 @@ export function KBSidenav({
         if (node.children) addWikiNodes(node.children, node.title)
       }
     }
-    addWikiNodes(wikiTree)
+    addWikiNodes(visibleWikiTree)
     for (const doc of sourceDocs) {
       const tags = doc.tags ?? []
       items.push({
@@ -137,7 +157,7 @@ export function KBSidenav({
       })
     }
     return items
-  }, [wikiTree, sourceDocs])
+  }, [visibleWikiTree, sourceDocs])
 
   const sourceCount = sourceDocs.length
 
@@ -164,6 +184,21 @@ export function KBSidenav({
           >
             <SearchIcon className="size-3.5" />
           </button>
+          {!courseMode && onRecentSelect && (
+            <button
+              onClick={onRecentSelect}
+              title="Recent changes"
+              aria-current={recentActive ? 'page' : undefined}
+              className={cn(
+                'flex size-8 cursor-pointer items-center justify-center rounded-md transition-colors',
+                recentActive
+                  ? 'bg-accent text-foreground'
+                  : 'text-muted-foreground/50 hover:bg-accent hover:text-muted-foreground',
+              )}
+            >
+              <History className="size-3.5" />
+            </button>
+          )}
           {!courseMode && (
             <>
               <button
@@ -312,6 +347,12 @@ export function KBSidenav({
           )}
           <CommandSeparator />
           <CommandGroup heading="Actions">
+            {!courseMode && onRecentSelect && (
+              <CommandItem onSelect={() => { setSearchOpen(false); onRecentSelect() }}>
+                <History className="size-3.5 mr-2 opacity-50" />
+                Recent changes
+              </CommandItem>
+            )}
             {!isLocal && (
               <CommandItem onSelect={() => { setSearchOpen(false); openMcpConnectionDock() }}>
                 <Plug className="size-3.5 mr-2 opacity-50" />
@@ -330,6 +371,25 @@ export function KBSidenav({
         </CommandList>
       </CommandDialog>
 
+      {!collapsed && !courseMode && onRecentSelect && (
+        <div className="shrink-0 px-2 pb-1 pt-1">
+          <button
+            type="button"
+            onClick={onRecentSelect}
+            aria-current={recentActive ? 'page' : undefined}
+            className={cn(
+              'flex w-full cursor-pointer items-center gap-2.5 rounded-md px-2 py-1.5 text-left text-[13px] transition-colors',
+              recentActive
+                ? 'bg-accent font-medium text-foreground'
+                : 'text-muted-foreground hover:bg-accent/50 hover:text-foreground',
+            )}
+          >
+            <History className="size-3 shrink-0 opacity-60" />
+            <span className="truncate">Recent</span>
+          </button>
+        </div>
+      )}
+
       {/* Wiki tree — top-level folders render as sections; pages grouped beneath a guide */}
       {!collapsed && (
       <>
@@ -337,7 +397,7 @@ export function KBSidenav({
         {loading ? (
           <SidenavSkeleton lines={3} />
         ) : hasWiki ? (
-          wikiTree.map((node, i) =>
+          visibleWikiTree.map((node, i) =>
             node.children && node.children.length > 0 ? (
               <WikiSection
                 key={node.path ?? node.title ?? i}
@@ -448,6 +508,8 @@ function wikiNodeIcon(node: WikiNode, depth: number) {
     return <BookOpen className="size-3 shrink-0 opacity-60" />
   if (slug === 'log' || (depth === 0 && titleLower === 'log'))
     return <ScrollText className="size-3 shrink-0 opacity-60" />
+  if (slug === 'plan' || (depth === 0 && titleLower === 'plan'))
+    return <ListChecks className="size-3 shrink-0 opacity-60" />
   if (slug === 'concepts' || (depth === 0 && titleLower === 'concepts'))
     return <Lightbulb className="size-3 shrink-0 opacity-60" />
   if (slug === 'entities' || (depth === 0 && titleLower === 'entities'))

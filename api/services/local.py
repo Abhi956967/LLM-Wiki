@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import uuid
 from pathlib import Path
@@ -17,6 +18,12 @@ from .base import DocumentService, KBService, ServiceFactory, UserService
 from .highlight_merge import merge_highlights_by_id
 from .parsers import extract_tags, parse_frontmatter, title_from_filename
 from .types import MAX_TEXT_CONTENT_BYTES
+
+# Mirrors the web's lesson definition (wikiTree.ts): wiki pages minus the structural hub/log/index.
+_LESSON_FILTER = (
+    "source_kind = 'wiki' AND status != 'failed' "
+    "AND (path || filename) NOT IN ('/wiki/overview.md', '/wiki/log.md', '/wiki/index.json')"
+)
 
 
 class LocalUserService(UserService):
@@ -64,7 +71,10 @@ class LocalKBService(KBService):
             "SELECT w.id, w.user_id, w.name, w.name as slug, w.description, w.kind, "
             "w.created_at, w.created_at as updated_at, "
             "(SELECT count(*) FROM documents WHERE source_kind = 'source' AND status != 'failed') as source_count, "
-            "(SELECT count(*) FROM documents WHERE source_kind = 'wiki' AND status != 'failed') as wiki_page_count "
+            "(SELECT count(*) FROM documents WHERE source_kind = 'wiki' AND status != 'failed') as wiki_page_count, "
+            f"(SELECT count(*) FROM documents WHERE {_LESSON_FILTER}) as lesson_count, "
+            f"(SELECT count(*) FROM documents WHERE {_LESSON_FILTER} "
+            "AND json_extract(metadata, '$.course.status') = 'complete') as lessons_completed "
             "FROM workspace w",
         )
         rows = await cursor.fetchall()
@@ -182,6 +192,33 @@ def _merge_text_anchors(payloads: list[dict], mapped) -> list[dict]:
     return out
 
 
+def _parse_web_clip(html: str, url: str, highlights: list[dict]):
+    """Run the synchronous HTML parser from a worker thread."""
+    from html_parser import Parser
+
+    parser = Parser(html, url=url, content_only=True)
+    return parser.parse(highlights=highlights)
+
+
+def _write_text_file(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+def _write_bytes_file(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+
+
+def _move_file(old_path: Path, new_path: Path) -> None:
+    new_path.parent.mkdir(parents=True, exist_ok=True)
+    old_path.rename(new_path)
+
+
+def _unlink_file(path: Path) -> None:
+    path.unlink(missing_ok=True)
+
+
 class LocalDocumentService(DocumentService):
 
     def __init__(self, db, user_id: str):
@@ -222,7 +259,7 @@ class LocalDocumentService(DocumentService):
         if len(content.encode("utf-8")) > MAX_TEXT_CONTENT_BYTES:
             raise HTTPException(status_code=413, detail="Text content exceeds the 10 MiB limit")
 
-        meta = parse_frontmatter(content)
+        meta = await asyncio.to_thread(parse_frontmatter, content)
         title = meta.get("title", "").strip() or title_from_filename(filename)
         tags = extract_tags(meta)
 
@@ -232,14 +269,13 @@ class LocalDocumentService(DocumentService):
 
         relative = (path.rstrip("/") + "/" + filename).lstrip("/")
         file_path = _safe_resolve(relative)
-        file_path.parent.mkdir(parents=True, exist_ok=True)
         mark_written(str(file_path))
-        file_path.write_text(content or "", encoding="utf-8")
+        await asyncio.to_thread(_write_text_file, file_path, content or "")
 
         row = await self.doc_repo.create_note(kb_id, self.user_id, filename, path, title, content, tags)
 
         if content:
-            chunks = chunk_text(content)
+            chunks = await asyncio.to_thread(chunk_text, content)
             await self.chunk_repo.store(str(row["id"]), self.user_id, kb_id, chunks)
 
         return row
@@ -248,11 +284,13 @@ class LocalDocumentService(DocumentService):
         self, kb_id: str, url: str, title: str, html: str,
         highlights: list[dict] | None = None, path: str = "/webclipper/",
     ) -> dict:
-        from html_parser import Parser
-
         path = _normalize_webclip_path(path)
-        parser = Parser(html, url=url, content_only=True)
-        result = parser.parse(highlights=highlights or [])
+        result = await asyncio.to_thread(
+            _parse_web_clip,
+            html,
+            url,
+            highlights or [],
+        )
         markdown = result.content
 
         base_name = re.sub(r"[^\w\s\-.]", "", title.lower().replace(" ", "-"))[:80].strip("-._")
@@ -292,9 +330,8 @@ class LocalDocumentService(DocumentService):
                 asset_path = f"{path}{asset_dir_name}/"
                 relative_asset = f"{relative_dir}/{asset.src}" if relative_dir else asset.src
                 local_asset = _safe_resolve(relative_asset)
-                local_asset.parent.mkdir(parents=True, exist_ok=True)
                 mark_written(str(local_asset))
-                local_asset.write_bytes(asset.data)
+                await asyncio.to_thread(_write_bytes_file, local_asset, asset.data)
                 await self.doc_repo.create_asset(
                     asset_id,
                     self.user_id,
@@ -331,14 +368,13 @@ class LocalDocumentService(DocumentService):
                 doc["highlights"] = fresh_highlights["highlights"]
             return doc
 
-        file_path.parent.mkdir(parents=True, exist_ok=True)
         mark_written(str(file_path))
-        file_path.write_text(markdown or "", encoding="utf-8")
+        await asyncio.to_thread(_write_text_file, file_path, markdown or "")
 
         try:
             row = await self.doc_repo.create_note(kb_id, self.user_id, filename, path, title, markdown, [])
         except Exception:
-            file_path.unlink(missing_ok=True)
+            await asyncio.to_thread(_unlink_file, file_path)
             raise
 
         parent_id = str(row["id"])
@@ -349,9 +385,8 @@ class LocalDocumentService(DocumentService):
             asset_path = f"{path}{asset_dir_name}/"
             relative_asset = f"{relative_dir}/{asset.src}" if relative_dir else asset.src
             local_asset = _safe_resolve(relative_asset)
-            local_asset.parent.mkdir(parents=True, exist_ok=True)
             mark_written(str(local_asset))
-            local_asset.write_bytes(asset.data)
+            await asyncio.to_thread(_write_bytes_file, local_asset, asset.data)
             await self.doc_repo.create_asset(
                 asset_id,
                 self.user_id,
@@ -376,7 +411,7 @@ class LocalDocumentService(DocumentService):
             await self.doc_repo.set_metadata_field(parent_id, "assets", asset_metadata)
 
         if markdown:
-            chunks = chunk_text(markdown)
+            chunks = await asyncio.to_thread(chunk_text, markdown)
             await self.chunk_repo.store(parent_id, self.user_id, kb_id, chunks)
 
         # replace_highlights AFTER chunks exist so the repo-level
@@ -435,13 +470,13 @@ class LocalDocumentService(DocumentService):
         file_path = _doc_to_disk_path(doc)
         if file_path:
             mark_written(str(file_path))
-            file_path.write_text(content, encoding="utf-8")
+            await asyncio.to_thread(_write_text_file, file_path, content)
 
         row = await self.doc_repo.update_content(doc_id, self.user_id, content)
 
         kb_id = await self.doc_repo.get_kb_id(doc_id)
         if kb_id:
-            chunks = chunk_text(content) if content else []
+            chunks = await asyncio.to_thread(chunk_text, content) if content else []
             await self.chunk_repo.store(doc_id, self.user_id, kb_id, chunks)
 
         return row
@@ -465,10 +500,9 @@ class LocalDocumentService(DocumentService):
             new_dir = fields.get("path", doc["path"])
             new_relative = (new_dir.rstrip("/") + "/" + new_filename).lstrip("/")
             new_path = _safe_resolve(new_relative)
-            new_path.parent.mkdir(parents=True, exist_ok=True)
             mark_written(str(old_path))
             mark_written(str(new_path))
-            old_path.rename(new_path)
+            await asyncio.to_thread(_move_file, old_path, new_path)
             fields["relative_path"] = new_relative
             fields["source_kind"] = "wiki" if new_dir.strip("/").startswith("wiki") else "source"
 
@@ -480,7 +514,7 @@ class LocalDocumentService(DocumentService):
             file_path = _doc_to_disk_path(doc)
             if file_path and file_path.is_file():
                 mark_written(str(file_path))
-                file_path.unlink()
+                await asyncio.to_thread(_unlink_file, file_path)
         return await self.doc_repo.archive(doc_id, self.user_id)
 
     async def bulk_delete(self, doc_ids: list[str]) -> int:
@@ -490,7 +524,7 @@ class LocalDocumentService(DocumentService):
                 file_path = _doc_to_disk_path(doc)
                 if file_path and file_path.is_file():
                     mark_written(str(file_path))
-                    file_path.unlink()
+                    await asyncio.to_thread(_unlink_file, file_path)
         return await self.doc_repo.bulk_archive(doc_ids, self.user_id)
 
 

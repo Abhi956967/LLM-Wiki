@@ -1,19 +1,25 @@
 import Link from 'next/link'
-import { ArrowRight, BookOpen, FileText, PenTool, Search, GitBranch } from 'lucide-react'
+import { ArrowRight, BookOpen, FileText, PenTool, Search, GitBranch, History } from 'lucide-react'
 import { AuthRedirect } from './AuthRedirect'
 import { MotionDiv, MotionP } from './LandingMotion'
 
 const ease: [number, number, number, number] = [0.16, 1, 0.3, 1]
 
 const WIKI_TREE = [
-  { label: 'Overview', active: true, depth: 0 },
+  { label: 'Recent', active: true, depth: 0 },
+  { label: 'Overview', depth: 0 },
   { label: 'Concepts', depth: 0, folder: true },
   { label: 'Attention Mechanisms', depth: 1 },
   { label: 'Scaling Laws', depth: 1 },
   { label: 'Entities', depth: 0, folder: true },
   { label: 'Transformer Architecture', depth: 1 },
   { label: 'Sources', depth: 0, folder: true },
-  { label: 'Log', depth: 0 },
+]
+
+const RECENT_CHANGES = [
+  { time: '10:42', verb: 'Edited', subject: 'Sparse attention', meta: '4 edits' },
+  { time: '09:18', verb: 'Added', subject: 'attention-is-all-you-need.pdf', meta: 'PDF' },
+  { time: '08:56', verb: 'Created', subject: 'Evaluation methodology', meta: '' },
 ]
 
 const jsonLd = {
@@ -167,7 +173,9 @@ export default function LandingPage() {
                       }`}
                       style={{ paddingLeft: `${item.depth * 14 + 8}px` }}
                     >
-                      {item.folder ? (
+                      {item.label === 'Recent' ? (
+                        <History className="size-3 opacity-40" />
+                      ) : item.folder ? (
                         <GitBranch className="size-3 opacity-40" />
                       ) : (
                         <FileText className="size-3 opacity-40" />
@@ -180,27 +188,37 @@ export default function LandingPage() {
 
               {/* Content */}
               <div className="flex-1 p-8 sm:p-10">
-                <div className="max-w-lg">
-                  <h2 className="text-xl font-semibold tracking-tight mb-1">Overview</h2>
-                  <p className="text-xs text-muted-foreground mb-6">
-                    12 sources &middot; Last updated 2 hours ago
+                <div className="max-w-xl">
+                  <p className="mb-2 text-[9px] font-semibold uppercase tracking-[0.1em] text-muted-foreground/50">
+                    Transformer research
                   </p>
-                  <p className="text-sm text-muted-foreground leading-relaxed mb-3">
-                    This wiki tracks research on transformer architectures and their scaling properties.
-                    It synthesizes findings from <span className="font-medium text-foreground">12 sources</span> across 47 pages.
+                  <h2 className="text-xl font-semibold tracking-tight">Recent changes</h2>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    The latest pages, edits, and sources in this wiki.
                   </p>
-                  <h3 className="text-sm font-semibold mt-5 mb-2">Key Findings</h3>
-                  <p className="text-sm text-muted-foreground leading-relaxed mb-3">
-                    The relationship between model size and performance follows predictable{' '}
-                    <span className="font-medium text-foreground">scaling laws</span> &mdash;
-                    loss decreases as a power law of compute, dataset size, and parameter count.
-                  </p>
-                  <h3 className="text-sm font-semibold mt-5 mb-2">Recent Updates</h3>
-                  <ul className="space-y-1 ml-4">
-                    <li className="text-sm text-muted-foreground list-disc">Added analysis of sparse attention variants</li>
-                    <li className="text-sm text-muted-foreground list-disc">Updated scaling laws with new benchmarks</li>
-                    <li className="text-sm text-muted-foreground list-disc">Flagged contradiction between Chen et al. and Wei et al.</li>
-                  </ul>
+                  <div className="mt-9">
+                    <h3 className="mb-1 text-[9px] font-semibold uppercase tracking-[0.1em] text-muted-foreground/50">
+                      Today
+                    </h3>
+                    {RECENT_CHANGES.map((change) => (
+                      <div
+                        key={`${change.time}-${change.subject}`}
+                        className="grid grid-cols-[2.75rem_1.5rem_minmax(0,1fr)] items-center gap-2.5 border-b border-border/70 py-3 text-xs"
+                      >
+                        <span className="tabular-nums text-[10px] text-muted-foreground/50">{change.time}</span>
+                        <span className="grid size-6 place-items-center rounded-full bg-muted/60 text-muted-foreground">
+                          <FileText className="size-3" />
+                        </span>
+                        <span className="min-w-0 truncate">
+                          <span className="mr-1.5 text-muted-foreground">{change.verb}</span>
+                          <span className="font-medium text-foreground">{change.subject}</span>
+                          {change.meta && (
+                            <span className="ml-2 text-[10px] text-muted-foreground/45">{change.meta}</span>
+                          )}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               </div>
             </div>

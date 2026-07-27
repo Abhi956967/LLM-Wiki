@@ -5,6 +5,7 @@ import {
   setDocumentSourceUrl,
   uploadPdfBlob,
 } from "./api";
+import { API_WRITE_TIMEOUT_MS, DeadlineError } from "./deadline";
 
 const API_URL = "https://api.llmwiki.app";
 const ACCESS_TOKEN = "test-access-token";
@@ -47,18 +48,22 @@ describe("PDF API helpers", () => {
     ).resolves.toEqual(result);
 
     expect(fetchMock).toHaveBeenCalledOnce();
-    expect(fetchMock).toHaveBeenCalledWith(`${API_URL}/v1/documents/from-url`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${ACCESS_TOKEN}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        knowledge_base_id: KNOWLEDGE_BASE_ID,
-        url: pdfUrl,
-        path: "/research/",
+    expect(fetchMock).toHaveBeenCalledWith(
+      `${API_URL}/v1/documents/from-url`,
+      expect.objectContaining({
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${ACCESS_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          knowledge_base_id: KNOWLEDGE_BASE_ID,
+          url: pdfUrl,
+          path: "/research/",
+        }),
+        signal: expect.any(AbortSignal),
       }),
-    });
+    );
   });
 
   it("uploads the original Blob in local mode instead of materializing a number array", async () => {
@@ -145,13 +150,35 @@ describe("PDF API helpers", () => {
       setDocumentSourceUrl(API_URL, ACCESS_TOKEN, "doc-1", sourceUrl),
     ).resolves.toBeUndefined();
 
-    expect(fetchMock).toHaveBeenCalledWith(`${API_URL}/v1/documents/doc-1`, {
-      method: "PATCH",
-      headers: {
-        Authorization: `Bearer ${ACCESS_TOKEN}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ metadata: { source_url: sourceUrl } }),
-    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      `${API_URL}/v1/documents/doc-1`,
+      expect.objectContaining({
+        method: "PATCH",
+        headers: {
+          Authorization: `Bearer ${ACCESS_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ metadata: { source_url: sourceUrl } }),
+        signal: expect.any(AbortSignal),
+      }),
+    );
+  });
+
+  it("bounds a fetch that never settles", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>(() => {})));
+    try {
+      const result = ingestPdfFromUrl(
+        API_URL,
+        ACCESS_TOKEN,
+        "https://papers.example/stalled.pdf",
+        KNOWLEDGE_BASE_ID,
+      );
+      const expectation = expect(result).rejects.toBeInstanceOf(DeadlineError);
+      await vi.advanceTimersByTimeAsync(API_WRITE_TIMEOUT_MS);
+      await expectation;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

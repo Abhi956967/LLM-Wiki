@@ -2,11 +2,16 @@
 
 import importlib.machinery
 import importlib.util
+import re
 from pathlib import Path
 
 import httpx
 import pytest
-from infra.local_http import LocalHTTPBoundaryMiddleware, is_allowed_local_origin
+from infra.local_http import (
+    LocalHTTPBoundaryMiddleware,
+    extension_origin_regex,
+    is_allowed_local_origin,
+)
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Route
@@ -16,6 +21,12 @@ async def _endpoint(request):
     return JSONResponse({"ok": True})
 
 
+TRUSTED_EXTENSIONS = (
+    "chrome-extension://dibilaenlekndomfbampadehjeahemha",
+    "moz-extension://d28b2a6e-2456-4f45-9f65-e11c8ea1e65d",
+)
+
+
 def _app() -> Starlette:
     app = Starlette(
         routes=[Route("/", _endpoint, methods=["GET", "POST", "PUT", "PATCH", "DELETE"])]
@@ -23,6 +34,7 @@ def _app() -> Starlette:
     app.add_middleware(
         LocalHTTPBoundaryMiddleware,
         app_origin="http://localhost:3000",
+        extension_origins=TRUSTED_EXTENSIONS,
     )
     return app
 
@@ -75,13 +87,28 @@ async def test_allows_local_web_ui_mutations(method):
 @pytest.mark.parametrize(
     "origin",
     [
-        "chrome-extension://abcdefghijklmnopqrstuvwxyzabcdef",
+        "chrome-extension://dibilaenlekndomfbampadehjeahemha",
         "moz-extension://d28b2a6e-2456-4f45-9f65-e11c8ea1e65d",
     ],
 )
 async def test_allows_browser_extension_mutations(origin):
-    assert is_allowed_local_origin(origin, "http://localhost:3000")
+    assert is_allowed_local_origin(origin, "http://localhost:3000", TRUSTED_EXTENSIONS)
     assert (await _request("POST", origin=origin)).status_code == 200
+
+
+async def test_rejects_untrusted_browser_extension():
+    origin = "chrome-extension://abcdefghijklmnopqrstuvwxyzabcdef"
+    assert not is_allowed_local_origin(origin, "http://localhost:3000", TRUSTED_EXTENSIONS)
+    assert (await _request("POST", origin=origin)).status_code == 403
+
+
+def test_extension_cors_regex_matches_only_configured_ids():
+    pattern = extension_origin_regex(TRUSTED_EXTENSIONS)
+    assert re.fullmatch(pattern, TRUSTED_EXTENSIONS[0])
+    assert not re.fullmatch(
+        pattern,
+        "chrome-extension://abcdefghijklmnopqrstuvwxyzabcdef",
+    )
 
 
 @pytest.mark.parametrize("origin", ["https://attacker.example", "null", "http://localhost:3001"])

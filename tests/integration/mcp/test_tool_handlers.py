@@ -25,6 +25,25 @@ class _AcceptDeleteContext:
 
 class TestWriteReadFlow:
 
+    async def test_edit_tool_schema_uses_anthropic_string_names(self):
+        from mcp.server.fastmcp import FastMCP
+        from tools.write import register
+
+        mcp = FastMCP("test")
+        register(mcp, lambda _ctx: "user", lambda _user_id: None)
+
+        tools = await mcp.list_tools()
+        tool = next(tool for tool in tools if tool.name == "edit")
+        properties = tool.inputSchema["properties"]
+        required = tool.inputSchema["required"]
+
+        assert "old_string" in properties
+        assert "new_string" in properties
+        assert "old_string" in required
+        assert "new_string" in required
+        assert "old_text" not in properties
+        assert "new_text" not in properties
+
     async def test_create_then_read_round_trip(self, fs):
         instance, kb_id = fs
         from tools.write import WriteHandler

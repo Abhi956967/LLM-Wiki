@@ -112,26 +112,37 @@ function matchesSuffix(host: string, suffix: string): boolean {
   return host === suffix || host.endsWith(`.${suffix}`);
 }
 
+export function normalizeHost(host: string): string {
+  return host.trim().toLowerCase().replace(/^www\./, "").replace(/\.$/, "");
+}
+
 export function isBuiltInDisabledHost(host: string): boolean {
-  const h = host.toLowerCase();
+  const h = normalizeHost(host);
   return BUILT_IN_DISABLED_SUFFIXES.some((suffix) => matchesSuffix(h, suffix));
 }
 
 export async function getDisabledDomains(): Promise<string[]> {
   const result = await chrome.storage.local.get(DISABLED_DOMAINS_KEY);
   const value = result[DISABLED_DOMAINS_KEY];
-  return Array.isArray(value) ? value.filter((v) => typeof v === "string") : [];
+  if (!Array.isArray(value)) return [];
+  return Array.from(new Set(
+    value
+      .filter((v): v is string => typeof v === "string")
+      .map(normalizeHost)
+      .filter(Boolean),
+  ));
 }
 
 export async function isDomainDisabled(host: string): Promise<boolean> {
   if (isBuiltInDisabledHost(host)) return true;
   const list = await getDisabledDomains();
-  const h = host.toLowerCase();
+  const h = normalizeHost(host);
   return list.includes(h);
 }
 
 export async function setDomainDisabled(host: string, disabled: boolean): Promise<void> {
-  const h = host.toLowerCase();
+  const h = normalizeHost(host);
+  if (!h) return;
   const list = await getDisabledDomains();
   const has = list.includes(h);
   if (disabled && !has) {

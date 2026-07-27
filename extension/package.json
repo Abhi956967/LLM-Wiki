@@ -1,12 +1,13 @@
 {
   "name": "llmwiki-extension",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "scripts": {
     "dev": "wxt",
     "build": "wxt build",
     "zip": "wxt zip",
+    "verify:package": "node verify-package.mjs",
     "check": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest"
@@ -49,9 +50,10 @@
     "minimatch": "10.2.3",
     "multimatch": {
       "minimatch": "3.1.4",
-      "brace-expansion": "1.1.13"
+      "brace-expansion": "1.1.16"
     },
-    "brace-expansion": "5.0.6",
+    "adm-zip": "0.6.0",
+    "brace-expansion": "5.0.7",
     "picomatch": "4.0.4",
     "@aklinker1/rollup-plugin-visualizer": {
       "picomatch": "2.3.2"

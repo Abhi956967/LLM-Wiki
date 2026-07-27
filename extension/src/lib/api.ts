@@ -1,3 +1,11 @@
+import {
+  API_READ_TIMEOUT_MS,
+  API_WRITE_TIMEOUT_MS,
+  PDF_UPLOAD_TIMEOUT_MS,
+  runWithDeadline,
+  runtimeMessageWithDeadline,
+} from "./deadline";
+
 export interface KnowledgeBase {
   id: string;
   name: string;
@@ -126,6 +134,7 @@ interface SmartFetchInit {
   method?: string;
   headers?: Record<string, string>;
   body?: string;
+  timeoutMs?: number;
 }
 
 interface SmartFetchResponse {
@@ -136,14 +145,25 @@ interface SmartFetchResponse {
 }
 
 async function smartFetch(url: string, init?: SmartFetchInit): Promise<SmartFetchResponse> {
+  const timeoutMs = init?.timeoutMs ?? API_READ_TIMEOUT_MS;
   if (isContentScriptContext()) {
-    const resp = await chrome.runtime.sendMessage({
-      type: "API_FETCH",
-      url,
-      method: init?.method ?? "GET",
-      headers: init?.headers,
-      body: init?.body,
-    });
+    const resp = await runtimeMessageWithDeadline<{
+      ok?: boolean;
+      status?: number;
+      data?: unknown;
+      error?: string;
+    }>(
+      {
+        type: "API_FETCH",
+        url,
+        method: init?.method ?? "GET",
+        headers: init?.headers,
+        body: init?.body,
+        timeoutMs,
+      },
+      timeoutMs + 1_000,
+      "The API request did not receive a background response",
+    );
     if (resp?.error && resp?.status === 0) {
       throw new Error(resp.error);
     }
@@ -160,17 +180,24 @@ async function smartFetch(url: string, init?: SmartFetchInit): Promise<SmartFetc
       text,
     };
   }
-  const res = await fetch(url, init);
-  const text = await res.text();
-  let data: unknown = null;
-  if (text) {
-    try {
-      data = JSON.parse(text);
-    } catch {
-      data = text;
+  return runWithDeadline(async (signal) => {
+    const res = await fetch(url, {
+      method: init?.method,
+      headers: init?.headers,
+      body: init?.body,
+      signal,
+    });
+    const text = await res.text();
+    let data: unknown = null;
+    if (text) {
+      try {
+        data = JSON.parse(text);
+      } catch {
+        data = text;
+      }
     }
-  }
-  return { ok: res.ok, status: res.status, data, text };
+    return { ok: res.ok, status: res.status, data, text };
+  }, timeoutMs, `API request timed out after ${Math.ceil(timeoutMs / 1_000)} seconds`);
 }
 
 export async function fetchKnowledgeBases(
@@ -189,13 +216,14 @@ export async function createKnowledgeBase(
   accessToken: string | null,
   name: string,
 ): Promise<KnowledgeBase> {
-  const res = await fetch(`${apiUrl}/v1/knowledge-bases`, {
+  const res = await smartFetch(`${apiUrl}/v1/knowledge-bases`, {
     method: "POST",
     headers: jsonHeaders(accessToken),
     body: JSON.stringify({ name }),
+    timeoutMs: API_WRITE_TIMEOUT_MS,
   });
   if (!res.ok) throw new Error(`Failed to create knowledge base: ${res.status}`);
-  return res.json();
+  return res.data as KnowledgeBase;
 }
 
 export async function saveWebPage(
@@ -210,6 +238,7 @@ export async function saveWebPage(
       method: "POST",
       headers: jsonHeaders(accessToken),
       body: JSON.stringify(payload),
+      timeoutMs: API_WRITE_TIMEOUT_MS,
     },
   );
   if (!res.ok) {
@@ -258,6 +287,7 @@ export async function replaceHighlights(
       method: "PATCH",
       headers: jsonHeaders(accessToken),
       body: JSON.stringify({ highlights, expectedVersion }),
+      timeoutMs: API_WRITE_TIMEOUT_MS,
     },
   );
   if (res.status === 409) {
@@ -279,6 +309,7 @@ export async function moveDocument(
     method: "PATCH",
     headers: jsonHeaders(accessToken),
     body: JSON.stringify({ knowledge_base_id: knowledgeBaseId }),
+    timeoutMs: API_WRITE_TIMEOUT_MS,
   });
   if (!res.ok) {
     throw new Error(`Move failed (${res.status})`);
@@ -292,19 +323,22 @@ export async function ingestPdfFromUrl(
   knowledgeBaseId: string,
   path = "/webclipper/",
 ): Promise<SaveResult> {
-  const response = await fetch(`${apiUrl}/v1/documents/from-url`, {
-    method: "POST",
-    headers: jsonHeaders(accessToken),
-    body: JSON.stringify({
-      knowledge_base_id: knowledgeBaseId,
-      url,
-      path,
-    }),
-  });
-  if (!response.ok) {
-    throw new PdfIngestError(response.status, await errorDetail(response));
-  }
-  return response.json() as Promise<SaveResult>;
+  return runWithDeadline(async (signal) => {
+    const response = await fetch(`${apiUrl}/v1/documents/from-url`, {
+      method: "POST",
+      headers: jsonHeaders(accessToken),
+      body: JSON.stringify({
+        knowledge_base_id: knowledgeBaseId,
+        url,
+        path,
+      }),
+      signal,
+    });
+    if (!response.ok) {
+      throw new PdfIngestError(response.status, await errorDetail(response));
+    }
+    return response.json() as Promise<SaveResult>;
+  }, API_WRITE_TIMEOUT_MS, "PDF URL ingestion timed out");
 }
 
 export async function setDocumentSourceUrl(
@@ -313,14 +347,17 @@ export async function setDocumentSourceUrl(
   documentId: string,
   sourceUrl: string,
 ): Promise<void> {
-  const response = await fetch(`${apiUrl}/v1/documents/${documentId}`, {
-    method: "PATCH",
-    headers: jsonHeaders(accessToken),
-    body: JSON.stringify({ metadata: { source_url: sourceUrl } }),
-  });
-  if (!response.ok) {
-    throw new Error(`Could not record PDF source URL (${response.status})`);
-  }
+  await runWithDeadline(async (signal) => {
+    const response = await fetch(`${apiUrl}/v1/documents/${documentId}`, {
+      method: "PATCH",
+      headers: jsonHeaders(accessToken),
+      body: JSON.stringify({ metadata: { source_url: sourceUrl } }),
+      signal,
+    });
+    if (!response.ok) {
+      throw new Error(`Could not record PDF source URL (${response.status})`);
+    }
+  }, API_READ_TIMEOUT_MS, "Recording the PDF source URL timed out");
 }
 
 export async function upsertHighlight(
@@ -336,6 +373,7 @@ export async function upsertHighlight(
       method: "POST",
       headers: jsonHeaders(accessToken),
       body: JSON.stringify({ highlight, expectedVersion }),
+      timeoutMs: API_WRITE_TIMEOUT_MS,
     },
   );
   if (res.status === 409) {
@@ -362,6 +400,7 @@ export async function deleteHighlight(
     {
       method: "DELETE",
       headers: authHeaders(accessToken),
+      timeoutMs: API_WRITE_TIMEOUT_MS,
     },
   );
   if (res.status === 409) {
@@ -386,13 +425,16 @@ export async function uploadPdfBlob(
     const form = new FormData();
     form.append("file", pdf, filename);
     form.append("path", path);
-    const res = await fetch(`${apiUrl}/v1/upload`, {
-      method: "POST",
-      body: form,
-    });
-    if (!res.ok) throw new Error(`Upload failed: ${res.status}`);
-    const data = await res.json();
-    return { id: data.id, status: "pending" };
+    return runWithDeadline(async (signal) => {
+      const res = await fetch(`${apiUrl}/v1/upload`, {
+        method: "POST",
+        body: form,
+        signal,
+      });
+      if (!res.ok) throw new Error(`Upload failed: ${res.status}`);
+      const data = await res.json();
+      return { id: data.id, status: "pending" };
+    }, PDF_UPLOAD_TIMEOUT_MS, "PDF upload timed out");
   }
 
   // Cloud mode: TUS upload
@@ -402,18 +444,28 @@ export async function uploadPdfBlob(
     `path ${utf8Base64(path)}`,
   ].join(",");
 
-  const createRes = await fetch(`${apiUrl}/v1/uploads`, {
-    method: "POST",
-    headers: {
-      ...authHeaders(accessToken),
-      "Tus-Resumable": "1.0.0",
-      "Upload-Length": String(pdf.size),
-      "Upload-Metadata": metadata,
+  const { response: createRes, errorText: createErrorText } = await runWithDeadline(
+    async (signal) => {
+      const response = await fetch(`${apiUrl}/v1/uploads`, {
+        method: "POST",
+        headers: {
+          ...authHeaders(accessToken),
+          "Tus-Resumable": "1.0.0",
+          "Upload-Length": String(pdf.size),
+          "Upload-Metadata": metadata,
+        },
+        signal,
+      });
+      return {
+        response,
+        errorText: response.ok ? "" : await response.text(),
+      };
     },
-  });
+    API_WRITE_TIMEOUT_MS,
+    "PDF upload initialization timed out",
+  );
   if (!createRes.ok) {
-    const text = await createRes.text();
-    throw new Error(`Upload init failed (${createRes.status}): ${text}`);
+    throw new Error(`Upload init failed (${createRes.status}): ${createErrorText}`);
   }
 
   const location = createRes.headers.get("Location");
@@ -422,16 +474,21 @@ export async function uploadPdfBlob(
     ? location
     : `${apiUrl}${location}`;
 
-  const patchRes = await fetch(uploadUrl, {
-    method: "PATCH",
-    headers: {
-      ...authHeaders(accessToken),
-      "Tus-Resumable": "1.0.0",
-      "Upload-Offset": "0",
-      "Content-Type": "application/offset+octet-stream",
-    },
-    body: pdf,
-  });
+  const patchRes = await runWithDeadline(
+    (signal) => fetch(uploadUrl, {
+      method: "PATCH",
+      headers: {
+        ...authHeaders(accessToken),
+        "Tus-Resumable": "1.0.0",
+        "Upload-Offset": "0",
+        "Content-Type": "application/offset+octet-stream",
+      },
+      body: pdf,
+      signal,
+    }),
+    PDF_UPLOAD_TIMEOUT_MS,
+    "PDF upload timed out",
+  );
   if (!patchRes.ok && patchRes.status !== 204) {
     throw new Error(`Upload failed: ${patchRes.status}`);
   }

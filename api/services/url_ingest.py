@@ -11,10 +11,14 @@ from uuid import uuid4
 
 import asyncpg
 import httpx
-from fastapi import HTTPException
-
 from config import settings
-from infra.safe_fetch import build_pinned_request, parse_public_fetch_url, redirect_location, resolve_public_ip
+from fastapi import HTTPException
+from infra.safe_fetch import (
+    build_pinned_request,
+    parse_public_fetch_url,
+    redirect_location,
+    resolve_public_ip,
+)
 from services.types import DownloadedPdf
 
 if TYPE_CHECKING:
@@ -50,32 +54,62 @@ class UrlIngestService:
         return await self._create_pending_document(user_id, kb_id, url, path, pdf)
 
     async def _download(self, url: str) -> DownloadedPdf:
-        current = url
-        async with httpx.AsyncClient(timeout=DOWNLOAD_TIMEOUT, follow_redirects=False, trust_env=False) as client:
-            for _ in range(MAX_REDIRECTS + 1):
-                parsed = parse_public_fetch_url(current)
-                if not parsed:
-                    raise HTTPException(status_code=400, detail="URL must be a public http(s) address")
-                ip = resolve_public_ip(parsed.hostname)
-                if not ip:
-                    raise HTTPException(status_code=400, detail="URL host is not publicly reachable")
-                request = build_pinned_request(
-                    client, parsed, ip,
-                    {"Accept": "application/pdf,*/*", "User-Agent": USER_AGENT},
-                )
-                try:
-                    resp = await client.send(request, stream=True)
-                except httpx.HTTPError as e:
-                    raise HTTPException(status_code=400, detail=f"Could not fetch URL: {e}")
-                try:
-                    redirect = redirect_location(resp, current)
-                    if redirect:
-                        current = redirect
-                        continue
-                    return self._validate_pdf_response(resp, await self._read_capped(resp), current)
-                finally:
-                    await resp.aclose()
-        raise HTTPException(status_code=400, detail="Too many redirects")
+        try:
+            # httpx's timeout applies to individual I/O phases. This outer
+            # deadline also covers DNS, redirects, body streaming, and cleanup.
+            async with asyncio.timeout(DOWNLOAD_TIMEOUT):
+                current = url
+                async with httpx.AsyncClient(
+                    timeout=DOWNLOAD_TIMEOUT,
+                    follow_redirects=False,
+                    trust_env=False,
+                ) as client:
+                    for _ in range(MAX_REDIRECTS + 1):
+                        parsed = parse_public_fetch_url(current)
+                        if not parsed:
+                            raise HTTPException(
+                                status_code=400,
+                                detail="URL must be a public http(s) address",
+                            )
+                        # getaddrinfo is blocking on common platforms. Keep it
+                        # off the event loop while retaining the all-addresses
+                        # public-IP check and subsequent IP-pinned request.
+                        ip = await asyncio.to_thread(resolve_public_ip, parsed.hostname)
+                        if not ip:
+                            raise HTTPException(
+                                status_code=400,
+                                detail="URL host is not publicly reachable",
+                            )
+                        request = build_pinned_request(
+                            client,
+                            parsed,
+                            ip,
+                            {"Accept": "application/pdf,*/*", "User-Agent": USER_AGENT},
+                        )
+                        try:
+                            resp = await client.send(request, stream=True)
+                        except httpx.HTTPError as e:
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"Could not fetch URL: {e}",
+                            ) from e
+                        try:
+                            redirect = redirect_location(resp, current)
+                            if redirect:
+                                current = redirect
+                                continue
+                            data = await self._read_capped(resp)
+                            return self._validate_pdf_response(resp, data, current)
+                        finally:
+                            await resp.aclose()
+                raise HTTPException(status_code=400, detail="Too many redirects")
+        except TimeoutError as e:
+            # Keep this a 400 so callers can fall back to browser-side capture
+            # for URLs that the server cannot fetch within its bounded budget.
+            raise HTTPException(
+                status_code=400,
+                detail="Could not fetch URL before timeout",
+            ) from e
 
     async def _read_capped(self, resp: httpx.Response) -> bytes:
         if resp.status_code != 200:
@@ -107,9 +141,12 @@ class UrlIngestService:
         s3_key = f"{user_id}/{document_id}/source.pdf"
         try:
             await self.s3.upload_bytes(s3_key, pdf.data, "application/pdf")
-        except Exception:
+        except Exception as e:  # noqa: BLE001 -- storage adapters have heterogeneous errors
             await self._delete_document_row(document_id)
-            raise HTTPException(status_code=502, detail="Could not store the downloaded PDF — try again")
+            raise HTTPException(
+                status_code=502,
+                detail="Could not store the downloaded PDF — try again",
+            ) from e
 
         asyncio.create_task(self.ocr.process_document(document_id, user_id))
         return {
@@ -133,17 +170,16 @@ class UrlIngestService:
         """Quota check + pending-row insert under a per-user advisory lock, so
         concurrent ingests cannot all pass the same SUM(file_size) read."""
         title = pdf.filename.rsplit(".", 1)[0]
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", user_id)
-                await self._check_storage_quota(conn, user_id, len(pdf.data))
-                await conn.execute(
-                    "INSERT INTO documents (id, knowledge_base_id, user_id, filename, path, title, "
-                    "file_type, file_size, status, metadata) "
-                    "VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, 'pdf', $7, 'pending', $8::jsonb)",
-                    document_id, kb_id, user_id, pdf.filename, path, title,
-                    len(pdf.data), json.dumps({"source_url": url}),
-                )
+        async with self.pool.acquire() as conn, conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", user_id)
+            await self._check_storage_quota(conn, user_id, len(pdf.data))
+            await conn.execute(
+                "INSERT INTO documents (id, knowledge_base_id, user_id, filename, path, title, "
+                "file_type, file_size, status, metadata) "
+                "VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, 'pdf', $7, 'pending', $8::jsonb)",
+                document_id, kb_id, user_id, pdf.filename, path, title,
+                len(pdf.data), json.dumps({"source_url": url}),
+            )
 
     async def _check_storage_quota(self, conn: asyncpg.Connection, user_id: str, incoming_bytes: int) -> None:
         row = await conn.fetchrow(

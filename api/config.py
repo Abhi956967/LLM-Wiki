@@ -35,6 +35,11 @@ class Settings(BaseSettings):
     STAGE: str = "dev"
     APP_URL: str = "http://localhost:3000"
     API_URL: str = "http://localhost:8000"
+    # Comma-separated serialized origins. Override this with the ID shown by
+    # chrome://extensions when using an unpacked development build.
+    LOCAL_EXTENSION_ORIGINS: str = (
+        "chrome-extension://dibilaenlekndomfbampadehjeahemha"
+    )
 
     QUOTA_MAX_PAGES_PER_DOC: int = 300  # max pages per single document
     QUOTA_MAX_STORAGE_BYTES: int = 1_073_741_824  # 1 GB per user
@@ -81,6 +86,14 @@ class Settings(BaseSettings):
     def listen_database_url(self) -> str:
         """Connection for the LISTEN loop — direct if configured, else the pooler."""
         return self.DIRECT_DATABASE_URL or self.DATABASE_URL
+
+    @property
+    def local_extension_origins(self) -> tuple[str, ...]:
+        return tuple(
+            origin.strip()
+            for origin in self.LOCAL_EXTENSION_ORIGINS.split(",")
+            if origin.strip()
+        )
 
 
 settings = Settings()

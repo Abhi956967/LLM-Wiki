@@ -1,20 +1,22 @@
-import os
-import sys
+import asyncio
+import contextlib
+import contextvars
+import functools
 import hmac
 import json
-import signal
-import asyncio
 import logging
+import os
+import signal
 import subprocess
+import sys
 import tempfile
-import contextlib
 from collections import defaultdict
+from collections.abc import Iterator
 from pathlib import Path
 from urllib.parse import urlparse
-from collections.abc import Iterator
 
 import httpx
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO)
@@ -28,13 +30,25 @@ SUPPORTED_EXTENSIONS = OFFICE_EXTENSIONS | PDF_EXTENSIONS
 CONVERT_TIMEOUT = 120  # LibreOffice subprocess timeout (seconds)
 EXTRACT_TIMEOUT = 180  # opendataloader extraction timeout (seconds)
 MAX_SOURCE_BYTES = 200 * 1024 * 1024  # 200 MB — hard cap on downloaded file size
+# Opendataloader output is derived from untrusted documents. Bound every stage
+# that could otherwise amplify a crafted JSON result into large Python objects
+# or an oversized API response.
+MAX_EXTRACTION_JSON_BYTES = 64 * 1024 * 1024
+MAX_EXTRACTION_ELEMENTS = 100_000
+MAX_ELEMENT_CHILDREN = 10_000
+MAX_ELEMENT_TEXT_BYTES = 1024 * 1024
+MAX_EXTRACTED_TEXT_BYTES = 32 * 1024 * 1024
+MAX_EXTRACTION_RESPONSE_BYTES = 40 * 1024 * 1024
 # Defense-in-depth cap on the page-assembly loop. `number of pages` comes from
 # the untrusted PDF; a crafted /Count would otherwise drive an unbounded loop
 # that runs after the subprocess timeout no longer applies.
 MAX_PAGES = 10_000
 # Concurrent /extract jobs allowed at once. Each can spawn LibreOffice + a JVM,
 # so unbounded concurrency OOMs the container. Tune per container memory.
-MAX_CONCURRENT_EXTRACTIONS = int(os.environ.get("MAX_CONCURRENT_EXTRACTIONS", "2"))
+MAX_CONCURRENT_EXTRACTIONS = max(
+    1,
+    int(os.environ.get("MAX_CONCURRENT_EXTRACTIONS", "2")),
+)
 
 # Extraction runs opendataloader in a child process group (not the in-process
 # library call) so a timeout can kill the JVM instead of orphaning it.
@@ -72,7 +86,11 @@ def _extraction_slot() -> Iterator[None]:
     global _active_extractions
     if _active_extractions >= MAX_CONCURRENT_EXTRACTIONS:
         logger.warning("extract rejected: at capacity (%d concurrent)", _active_extractions)
-        raise HTTPException(503, "Converter at capacity, retry shortly")
+        raise HTTPException(
+            503,
+            "Converter at capacity, retry shortly",
+            headers={"Retry-After": "1"},
+        )
     _active_extractions += 1
     try:
         yield
@@ -106,6 +124,33 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
     proc.wait()
 
 
+async def _wait_ignoring_cancellation(future: asyncio.Future):
+    """Wait for already-started critical work despite repeated cancellation."""
+    while not future.done():
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            continue
+    return future.result()
+
+
+async def _to_thread_joined(func, /, *args, **kwargs):
+    """Keep a subprocess-owning worker inside its capacity slot until it exits."""
+    loop = asyncio.get_running_loop()
+    context = contextvars.copy_context()
+    call = functools.partial(context.run, func, *args, **kwargs)
+    # A raw executor Future is not swept up by loop-wide Task cancellation.
+    # That lets the request task join the actual process-owning thread before
+    # releasing the extraction capacity slot.
+    worker = loop.run_in_executor(None, call)
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        with contextlib.suppress(Exception):
+            await _wait_ignoring_cancellation(worker)
+        raise
+
+
 def _validate_s3_url(url: str) -> None:
     parsed = urlparse(url)
     if not parsed.hostname:
@@ -130,32 +175,98 @@ def _validate_s3_url(url: str) -> None:
         raise HTTPException(400, "URL does not point to the configured S3 bucket")
 
 
+def _bounded_utf8_size(value: str, max_bytes: int, label: str) -> int:
+    """Return UTF-8 size without allocating an unbounded encoded copy."""
+    if not isinstance(value, str):
+        raise RuntimeError(f"opendataloader {label} must be text")
+
+    total = 0
+    try:
+        for offset in range(0, len(value), 4096):
+            total += len(value[offset:offset + 4096].encode("utf-8"))
+            if total > max_bytes:
+                raise RuntimeError(f"opendataloader {label} exceeds safe size limit")
+    except UnicodeEncodeError as exc:
+        raise RuntimeError(f"opendataloader {label} contains invalid Unicode") from exc
+    return total
+
+
+def _ensure_bounded_json(value, max_bytes: int, label: str) -> None:
+    """Measure compact JSON incrementally instead of materializing it."""
+    total = 0
+    encoder = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"))
+    for piece in encoder.iterencode(value):
+        total += _bounded_utf8_size(piece, max_bytes - total, label)
+
+
 def _element_to_markdown(el: dict) -> str:
     """Convert a single JSON element to markdown."""
+    if not isinstance(el, dict):
+        raise RuntimeError("opendataloader elements must be objects")
     t = el.get("type", "")
-    content = el.get("content", "")
+    if not isinstance(t, str):
+        raise RuntimeError("opendataloader element type must be text")
+
+    used_bytes = 0
+
+    def take_text(value, label: str, overhead: int = 0) -> str:
+        nonlocal used_bytes
+        remaining = MAX_ELEMENT_TEXT_BYTES - used_bytes - overhead
+        size = _bounded_utf8_size(value, remaining, label)
+        used_bytes += size + overhead
+        return value
 
     if t == "heading":
-        level = max(1, min(el.get("heading level", 1), 6))
+        raw_level = el.get("heading level", 1)
+        level = max(1, min(raw_level, 6)) if type(raw_level) is int else 1
         prefix = "#" * level
+        content = take_text(el.get("content", ""), "heading text", level + 1)
         return f"{prefix} {content}"
 
     if t == "paragraph":
-        return content
+        return take_text(el.get("content", ""), "paragraph text")
 
     if t == "list":
+        items = el.get("list items", [])
+        if not isinstance(items, list):
+            raise RuntimeError("opendataloader list items must be a list")
+        if len(items) > MAX_ELEMENT_CHILDREN:
+            raise RuntimeError("opendataloader element has too many children")
+
         lines = []
-        for item in el.get("list items", []):
-            lines.append(f"- {item.get('content', '')}")
-            for child in item.get("kids", []):
-                lines.append(f"  - {child.get('content', '')}")
+        child_count = len(items)
+        for item in items:
+            if not isinstance(item, dict):
+                raise RuntimeError("opendataloader list items must be objects")
+            item_content = take_text(
+                item.get("content", ""),
+                "list item text",
+                2 + bool(lines),
+            )
+            lines.append(f"- {item_content}")
+            children = item.get("kids", [])
+            if not isinstance(children, list):
+                raise RuntimeError("opendataloader list children must be a list")
+            child_count += len(children)
+            if child_count > MAX_ELEMENT_CHILDREN:
+                raise RuntimeError("opendataloader element has too many children")
+            for child in children:
+                if not isinstance(child, dict):
+                    raise RuntimeError("opendataloader list children must be objects")
+                child_content = take_text(
+                    child.get("content", ""),
+                    "list child text",
+                    4 + bool(lines),
+                )
+                lines.append(f"  - {child_content}")
         return "\n".join(lines)
 
     if t == "image":
-        src = el.get("source", "")
+        src = take_text(el.get("source", ""), "image source", 10)
         return f"![image]({src})" if src else ""
 
     if t == "caption":
+        content = take_text(el.get("content", ""), "caption text", 2)
         return f"*{content}*" if content else ""
 
     return ""
@@ -169,35 +280,54 @@ def _extract_pages(pdf_path: str, output_dir: str) -> list[dict]:
         what="opendataloader",
     )
 
-    json_files = list(Path(output_dir).glob("*.json"))
-    if not json_files:
+    json_path = next(Path(output_dir).glob("*.json"), None)
+    if json_path is None:
         raise RuntimeError("opendataloader-pdf produced no output")
 
-    with open(json_files[0], encoding="utf-8") as f:
-        data = json.load(f)
+    if json_path.stat().st_size > MAX_EXTRACTION_JSON_BYTES:
+        raise RuntimeError("opendataloader JSON exceeds safe size limit")
+    with json_path.open("rb") as f:
+        raw_json = f.read(MAX_EXTRACTION_JSON_BYTES + 1)
+    if len(raw_json) > MAX_EXTRACTION_JSON_BYTES:
+        raise RuntimeError("opendataloader JSON exceeds safe size limit")
+    data = json.loads(raw_json)
+    if not isinstance(data, dict):
+        raise RuntimeError("opendataloader JSON root must be an object")
 
     total_pages = data.get("number of pages", 0)
-    if not isinstance(total_pages, int) or total_pages < 0:
+    if type(total_pages) is not int or total_pages < 0:
         total_pages = 0
     total_pages = min(total_pages, MAX_PAGES)
     elements = data.get("kids", [])
-    page_elements: dict[int, list[dict]] = defaultdict(list)
+    if not isinstance(elements, list):
+        raise RuntimeError("opendataloader kids must be a list")
+    if len(elements) > MAX_EXTRACTION_ELEMENTS:
+        raise RuntimeError("opendataloader produced too many elements")
+    page_parts: dict[int, list[str]] = defaultdict(list)
+    total_text_bytes = 0
 
     for el in elements:
+        if not isinstance(el, dict):
+            raise RuntimeError("opendataloader elements must be objects")
         page_num = el.get("page number")
-        if page_num is None or el.get("type") in ("header", "footer"):
+        if el.get("type") in ("header", "footer"):
             continue
-        page_elements[page_num].append(el)
+        if type(page_num) is not int or not 1 <= page_num <= total_pages:
+            continue
+        md = _element_to_markdown(el)
+        if not md:
+            continue
+        separator_bytes = 2 if page_parts[page_num] else 0
+        remaining = MAX_EXTRACTED_TEXT_BYTES - total_text_bytes - separator_bytes
+        md_bytes = _bounded_utf8_size(md, remaining, "total extracted text")
+        total_text_bytes += separator_bytes + md_bytes
+        page_parts[page_num].append(md)
 
     pages = []
     for page_num in range(1, total_pages + 1):
-        parts = []
-        for el in page_elements.get(page_num, []):
-            md = _element_to_markdown(el)
-            if md:
-                parts.append(md)
-        pages.append({"page": page_num, "content": "\n\n".join(parts)})
+        pages.append({"page": page_num, "content": "\n\n".join(page_parts[page_num])})
 
+    _ensure_bounded_json(pages, MAX_EXTRACTION_RESPONSE_BYTES, "extraction response")
     return pages
 
 
@@ -250,7 +380,7 @@ async def _to_pdf(source_path: Path, ext: str, tmpdir: str, request_id: str) -> 
     if ext not in OFFICE_EXTENSIONS:
         return source_path
     try:
-        return await asyncio.to_thread(_convert_to_pdf, source_path, tmpdir)
+        return await _to_thread_joined(_convert_to_pdf, source_path, tmpdir)
     except TimeoutError:
         logger.error("office->pdf conversion timed out after %ds request_id=%s", CONVERT_TIMEOUT, request_id)
         raise HTTPException(504, "Office conversion timed out")
@@ -264,7 +394,7 @@ async def _run_extraction(pdf_path: Path, tmpdir: str, request_id: str) -> list[
     extract_dir = Path(tmpdir) / "extract"
     extract_dir.mkdir()
     try:
-        return await asyncio.to_thread(_extract_pages, str(pdf_path), str(extract_dir))
+        return await _to_thread_joined(_extract_pages, str(pdf_path), str(extract_dir))
     except TimeoutError:
         logger.error("pdf extraction timed out after %ds request_id=%s", EXTRACT_TIMEOUT, request_id)
         raise HTTPException(504, f"PDF extraction exceeded {EXTRACT_TIMEOUT}s timeout")
@@ -316,4 +446,9 @@ async def extract(
     response = {"pages": pages, "page_count": page_count}
     if req.request_id:
         response["request_id"] = req.request_id
+    try:
+        _ensure_bounded_json(response, MAX_EXTRACTION_RESPONSE_BYTES, "extraction response")
+    except RuntimeError:
+        logger.error("extraction response exceeds safe size limit request_id=%s", request_id)
+        raise HTTPException(500, "Extraction output exceeded safe response limit")
     return response

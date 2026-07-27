@@ -1,3 +1,5 @@
+import { RUNTIME_MESSAGE_TIMEOUT_MS, withDeadline } from "./deadline";
+
 export async function isPdfTab(
   tabId: number,
   url: string,
@@ -42,10 +44,14 @@ function pathnameOf(url: string): string {
 // contentType even when the URL has no .pdf suffix (e.g. arxiv.org/pdf/<id>).
 async function tabReportsPdfContentType(tabId: number): Promise<boolean> {
   try {
-    const [{ result }] = await chrome.scripting.executeScript({
-      target: { tabId },
-      func: () => document.contentType,
-    });
+    const [{ result }] = await withDeadline(
+      chrome.scripting.executeScript({
+        target: { tabId },
+        func: () => document.contentType,
+      }),
+      RUNTIME_MESSAGE_TIMEOUT_MS,
+      "PDF detection did not finish",
+    );
     return result === "application/pdf";
   } catch {
     return false;

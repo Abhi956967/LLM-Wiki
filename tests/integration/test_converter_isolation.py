@@ -236,6 +236,103 @@ async def test_presigned_urls_are_scoped_to_exact_document_keys(monkeypatch):
     ]
 
 
+async def test_converter_extract_retries_capacity_response(monkeypatch):
+    ocr = _import_ocr_module(monkeypatch)
+    service = ocr.OCRService(RecordingS3(), pool=None)
+    statuses = [503, 503, 200]
+    attempts: list[str] = []
+    sleeps: list[float] = []
+
+    class FakeResponse:
+        def __init__(self, status_code: int, request_id: str):
+            self.status_code = status_code
+            self.headers = {"retry-after": "0"}
+            self._request_id = request_id
+
+        def raise_for_status(self):
+            if self.status_code != 200:
+                raise AssertionError("retryable response was not retried")
+
+        def json(self):
+            return {
+                "request_id": self._request_id,
+                "pages": [{"page": 1, "content": "recovered"}],
+            }
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, json, headers):
+            attempts.append(json["request_id"])
+            return FakeResponse(statuses.pop(0), json["request_id"])
+
+    async def fake_sleep(delay: float):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(ocr.settings, "CONVERTER_URL", "https://converter.test")
+    monkeypatch.setattr(ocr.httpx, "AsyncClient", lambda *args, **kwargs: FakeClient())
+    monkeypatch.setattr(ocr.asyncio, "sleep", fake_sleep)
+
+    pages = await service._call_converter_extract("https://s3.test/source.pdf", "pdf")
+
+    assert pages == [(1, "recovered")]
+    assert len(attempts) == 3
+    assert len(set(attempts)) == 1
+    assert sleeps == [0.0, 0.0]
+
+
+async def test_converter_extract_requests_are_bounded(monkeypatch):
+    ocr = _import_ocr_module(monkeypatch)
+    service = ocr.OCRService(RecordingS3(), pool=None)
+    active = 0
+    peak = 0
+
+    class FakeResponse:
+        status_code = 200
+        headers = {}
+
+        def __init__(self, request_id: str):
+            self._request_id = request_id
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "request_id": self._request_id,
+                "pages": [{"page": 1, "content": "ok"}],
+            }
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, json, headers):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return FakeResponse(json["request_id"])
+
+    monkeypatch.setattr(ocr.settings, "CONVERTER_URL", "https://converter.test")
+    monkeypatch.setattr(ocr.httpx, "AsyncClient", lambda *args, **kwargs: FakeClient())
+
+    await asyncio.gather(*(
+        service._call_converter_extract(f"https://s3.test/{i}.pdf", "pdf")
+        for i in range(5)
+    ))
+
+    assert peak == ocr.MAX_CONCURRENT_CONVERTER_REQUESTS == 2
+
+
 def test_tus_upload_namespace_isolation():
     from infra import tus
 

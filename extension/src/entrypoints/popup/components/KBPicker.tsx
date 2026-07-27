@@ -16,29 +16,39 @@ export default function KBPicker({ apiUrl, accessToken, value, onChange }: Props
   const [creating, setCreating] = useState(false);
   const [newName, setNewName] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
+  const valueRef = useRef(value);
+  const onChangeRef = useRef(onChange);
+  valueRef.current = value;
+  onChangeRef.current = onChange;
 
   useEffect(() => {
-    loadKBs();
+    let cancelled = false;
+    void loadKBs(() => cancelled);
+    return () => {
+      cancelled = true;
+    };
   }, [apiUrl, accessToken]);
 
   useEffect(() => {
     if (creating) inputRef.current?.focus();
   }, [creating]);
 
-  async function loadKBs() {
+  async function loadKBs(isCancelled: () => boolean) {
     setLoading(true);
     setError(null);
     try {
       const list = await fetchKnowledgeBases(apiUrl, accessToken);
+      if (isCancelled()) return;
       setKbs(list);
-      const selectionValid = value !== null && list.some((kb) => kb.id === value);
+      const selected = valueRef.current;
+      const selectionValid = selected !== null && list.some((kb) => kb.id === selected);
       if (!selectionValid && list.length > 0) {
-        onChange(list[0].id);
+        onChangeRef.current(list[0].id);
       }
     } catch {
-      setError("Failed to load knowledge bases");
+      if (!isCancelled()) setError("Failed to load knowledge bases");
     } finally {
-      setLoading(false);
+      if (!isCancelled()) setLoading(false);
     }
   }
 

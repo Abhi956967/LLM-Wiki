@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 MISTRAL_OCR_URL = "https://api.mistral.ai/v1/ocr"
 MAX_RETRIES = 3
 RETRY_BACKOFF = [2, 5, 10]
+MAX_CONCURRENT_CONVERTER_REQUESTS = 2
+CONVERTER_RETRY_BACKOFF = [1, 2]
 
 OFFICE_TYPES = {"pptx", "ppt", "docx", "doc"}
 IMAGE_TYPES = {"png", "jpg", "jpeg", "webp", "gif"}
@@ -31,11 +33,25 @@ def _extract_pdf_in_process(pdf_path: str):
 
     return extract_pdf(pdf_path)
 
+
+def _converter_retry_delay(retry_after: str | None, default: float) -> float:
+    if not retry_after:
+        return default
+    try:
+        return max(0.0, min(float(retry_after), 30.0))
+    except ValueError:
+        return default
+
+
 class OCRService:
     def __init__(self, s3: S3Service, pool: asyncpg.Pool):
         self._s3 = s3
         self._pool = pool
         self._semaphore = asyncio.Semaphore(3)
+        # Match the converter's default extraction capacity. This prevents one
+        # API worker from predictably overloading a single converter instance;
+        # retries below still cover capacity shared by multiple API workers.
+        self._converter_semaphore = asyncio.Semaphore(MAX_CONCURRENT_CONVERTER_REQUESTS)
 
     async def process_document(self, document_id: str, user_id: str):
         async with self._semaphore:
@@ -180,12 +196,33 @@ class OCRService:
         if settings.CONVERTER_SECRET:
             headers["Authorization"] = f"Bearer {settings.CONVERTER_SECRET}"
 
-        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
-            resp = await client.post(
-                f"{settings.CONVERTER_URL}/extract",
-                json={"source_url": source_url, "source_ext": ext, "request_id": request_id},
-                headers=headers,
-            )
+        payload = {"source_url": source_url, "source_ext": ext, "request_id": request_id}
+        async with (
+            self._converter_semaphore,
+            httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client,
+        ):
+            for attempt in range(MAX_RETRIES):
+                resp = await client.post(
+                    f"{settings.CONVERTER_URL}/extract",
+                    json=payload,
+                    headers=headers,
+                )
+                if resp.status_code != 503 or attempt == MAX_RETRIES - 1:
+                    break
+
+                delay = CONVERTER_RETRY_BACKOFF[
+                    min(attempt, len(CONVERTER_RETRY_BACKOFF) - 1)
+                ]
+                delay = _converter_retry_delay(resp.headers.get("retry-after"), delay)
+                logger.warning(
+                    "Converter at capacity; retrying request_id=%s attempt=%d/%d in %.1fs",
+                    request_id,
+                    attempt + 2,
+                    MAX_RETRIES,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+
             resp.raise_for_status()
             data = resp.json()
 

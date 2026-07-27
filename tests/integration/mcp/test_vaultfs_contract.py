@@ -28,13 +28,13 @@ class TestWorkspace:
             docs = await instance.list_documents(kb["id"])
             wiki_files = {doc["path"] + doc["filename"] for doc in docs}
             assert "/wiki/overview.md" in wiki_files
-            assert "/wiki/log.md" in wiki_files
+            assert "/wiki/log.md" not in wiki_files
             overview = await instance.get_document(kb["id"], "overview.md", "/wiki/")
             assert overview["content"].startswith("---\n")
             assert overview["tags"] == ["overview", "wiki"]
             assert overview["date"]
             assert (workspace / "wiki" / "overview.md").exists()
-            assert (workspace / "wiki" / "log.md").exists()
+            assert not (workspace / "wiki" / "log.md").exists()
         finally:
             await SqliteVaultFS.close()
 
@@ -59,9 +59,9 @@ class TestWorkspace:
             instance = SqliteVaultFS(TEST_USER_ID)
             await instance.create_knowledge_base("Rebuilt", None)
 
-            # The existing overview is preserved; the missing log is still scaffolded.
+            # The existing overview is preserved and no legacy activity log is scaffolded.
             assert (workspace / "wiki" / "overview.md").read_text(encoding="utf-8") == "MY REAL NOTES"
-            assert (workspace / "wiki" / "log.md").exists()
+            assert not (workspace / "wiki" / "log.md").exists()
         finally:
             await SqliteVaultFS.close()
 

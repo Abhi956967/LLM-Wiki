@@ -9,9 +9,10 @@ import rehypeKatex from 'rehype-katex'
 import 'katex/dist/katex.min.css'
 import type { Components } from 'react-markdown'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
-import { FileText, Copy, Check, Network, ChevronLeft, ChevronRight, ArrowRight, Trash2 } from 'lucide-react'
+import { FileText, Copy, Check, CircleAlert, Network, ChevronLeft, ChevronRight, ArrowRight, Trash2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { apiFetch } from '@/lib/api'
+import { parsePlanTasks, type PlanSummary, type TaskStatus } from '@/lib/planTasks'
 import { decodeUnicodeEscapes } from '@/lib/text'
 import { useUserStore } from '@/stores'
 import { ExpandableMedia } from './DiagramViewer'
@@ -20,7 +21,7 @@ import { WikiComments } from './WikiComments'
 import { useWikiHighlights } from '@/hooks/useWikiHighlights'
 import type { DocumentListItem } from '@/lib/types'
 
-const REMARK_PLUGINS = [remarkGfm, remarkMath, remarkFixOverescapedMath]
+const REMARK_PLUGINS = [remarkGfm, remarkMath, remarkFixOverescapedMath, remarkTaskStatus]
 const REHYPE_PLUGINS = [rehypeKatex]
 
 const MermaidBlock = dynamic(() => import('./MermaidBlock').then((mod) => mod.MermaidBlock), {
@@ -224,6 +225,81 @@ function remarkFixOverescapedMath() {
     node.children?.forEach(restore)
   }
   return restore
+}
+
+interface TaskListItem extends MdastLike {
+  checked?: boolean | null
+  data?: { hProperties?: Record<string, unknown> }
+}
+
+const EXTENDED_TASK_MARKER_RE = /^\[([~!])\](?:[ \t]+|$)/
+
+// remark-gfm only parses [ ]/[x]; the plan convention adds [~] in-progress and
+// [!] blocked, which arrive as literal text. Tag every task item with data-task
+// so the li renderer draws one glyph vocabulary for all four states.
+export function remarkTaskStatus() {
+  const visit = (node: TaskListItem): void => {
+    if (node.type === 'listItem') {
+      let status: TaskStatus | null = null
+      if (node.checked === true) status = 'done'
+      else if (node.checked === false) status = 'todo'
+      else {
+        const paragraph = node.children?.[0]
+        const text = paragraph?.type === 'paragraph' ? paragraph.children?.[0] : undefined
+        if (text?.type === 'text' && typeof text.value === 'string') {
+          const marker = text.value.match(EXTENDED_TASK_MARKER_RE)
+          if (marker) {
+            status = marker[1] === '~' ? 'in_progress' : 'blocked'
+            text.value = text.value.slice(marker[0].length)
+          }
+        }
+      }
+      if (status) {
+        node.data = node.data ?? {}
+        node.data.hProperties = { ...node.data.hProperties, 'data-task': status }
+      }
+    }
+    node.children?.forEach(visit)
+  }
+  return visit
+}
+
+function TaskGlyph({ status }: { status: string }) {
+  if (status === 'done') return <Check className="size-3.5 text-emerald-500" />
+  if (status === 'in_progress') return <span className="size-1.5 rounded-full bg-foreground" />
+  if (status === 'blocked') return <CircleAlert className="size-3.5 text-amber-500" />
+  return <span className="size-2.5 rounded-full border border-border" />
+}
+
+function PlanProgressHeader({ summary }: { summary: PlanSummary }) {
+  return (
+    <div className="mb-8">
+      <div className="flex items-center gap-3">
+        <div className="h-1 flex-1 overflow-hidden rounded-full bg-muted">
+          <div
+            className="h-full bg-foreground/30 transition-[width]"
+            style={{ width: `${Math.round((summary.done / summary.total) * 100)}%` }}
+          />
+        </div>
+        <span className="text-[11px] text-muted-foreground/50 tabular-nums">
+          {summary.done}/{summary.total}
+        </span>
+      </div>
+      <div className="mt-3 space-y-1">
+        {summary.stages.map((stage, index) => (
+          <div key={index} className="flex items-baseline justify-between gap-4 text-xs">
+            <span className="min-w-0 truncate text-muted-foreground">{stage.title || 'Tasks'}</span>
+            <span className="shrink-0 tabular-nums text-muted-foreground/60">
+              {stage.done}/{stage.total}
+              {stage.counts.blocked > 0 && (
+                <span className="text-amber-500"> · {stage.counts.blocked} blocked</span>
+              )}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
 }
 
 function TableOfContents({ items }: { items: TocItem[] }) {
@@ -609,6 +685,11 @@ export function WikiContent({ content, title, path, documentId = null, onNavigat
   const eyebrow = React.useMemo(() => pathEyebrow(path), [path])
   const tocItems = React.useMemo(() => extractTocFromMarkdown(processedContent), [processedContent])
   const footnoteSources = React.useMemo(() => parseFootnoteSources(processedContent), [processedContent])
+  const isPlanPage = path === 'plan.md'
+  const planSummary = React.useMemo(
+    () => (isPlanPage ? parsePlanTasks(processedContent) : null),
+    [isPlanPage, processedContent],
+  )
   const [copied, setCopied] = React.useState(false)
 
   const handleCopy = React.useCallback(() => {
@@ -870,11 +951,27 @@ export function WikiContent({ content, title, path, documentId = null, onNavigat
             </li>
           )
         }
+        const dp = props as Record<string, unknown>
+        const task = dp['data-task'] ?? dp.dataTask
+        if (typeof task === 'string') {
+          return (
+            <li data-task={task} className="my-1 flex list-none items-start gap-2 leading-[1.65]">
+              <span className="mt-[5px] flex size-3.5 shrink-0 items-center justify-center">
+                <TaskGlyph status={task} />
+              </span>
+              <div className="min-w-0 flex-1">{children}</div>
+            </li>
+          )
+        }
         return (
           <li className="my-0.5 leading-[1.65]" {...props}>
             {children}
           </li>
         )
+      },
+      input(props) {
+        if (props.type === 'checkbox') return null
+        return <input {...props} />
       },
       hr() {
         return <hr className="my-6 border-border/60" />
@@ -982,6 +1079,7 @@ export function WikiContent({ content, title, path, documentId = null, onNavigat
                 <p className="text-[15px] text-muted-foreground mt-2.5 leading-relaxed">{description}</p>
               )}
             </div>
+            {planSummary && planSummary.total > 0 && <PlanProgressHeader summary={planSummary} />}
             <div className="wiki-content text-[15px] leading-relaxed" ref={markdownRef}>
               <MarkdownBody
                 key={documentId ?? 'unpersisted'}

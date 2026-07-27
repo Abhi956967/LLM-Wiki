@@ -32,18 +32,7 @@ This wiki tracks research on {name}. No sources have been ingested yet.
 
 ## Key Findings
 
-No sources ingested yet - add your first source to get started.
-
-## Recent Updates
-
-No activity yet.\
-"""
-
-_LOG_TEMPLATE = """\
-Chronological record of ingests, queries, and maintenance passes.
-
-## [{date}] created | Wiki Created
-- Initialized wiki: {name}\
+No sources ingested yet - add your first source to get started.\
 """
 
 
@@ -94,7 +83,49 @@ class SqliteVaultFS(VaultFS):
         await _db.execute("PRAGMA journal_mode=WAL")
         await _db.execute("PRAGMA foreign_keys=ON")
         if _SCHEMA_PATH.exists():
+            events_table = await _db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'knowledge_base_events'",
+            )
+            had_events_table = await events_table.fetchone() is not None
             await _db.executescript(_SCHEMA_PATH.read_text(encoding='utf-8'))
+
+            # Existing local workspaces have exact creation facts worth
+            # preserving. updated_at is not reliable edit history, so no
+            # historical update events are synthesized.
+            await _db.execute(
+                "INSERT OR IGNORE INTO knowledge_base_events "
+                "(knowledge_base_id, user_id, event_type, subject_kind, subject_title, "
+                " event_key, occurred_at) "
+                "SELECT id, user_id, 'wiki.created', 'wiki', name, "
+                "       'kb:' || id || ':created', created_at FROM workspace",
+            )
+            await _db.execute(
+                "INSERT OR IGNORE INTO knowledge_base_events "
+                "(knowledge_base_id, user_id, event_type, subject_kind, document_id, "
+                " document_number, document_version, subject_title, subject_path, "
+                " event_key, metadata, occurred_at) "
+                "SELECT (SELECT id FROM workspace LIMIT 1), d.user_id, "
+                "       CASE WHEN d.source_kind = 'wiki' THEN 'page.created' ELSE 'source.added' END, "
+                "       CASE WHEN d.source_kind = 'wiki' THEN 'wiki_page' ELSE 'source' END, "
+                "       d.id, d.document_number, d.version, "
+                "       COALESCE(NULLIF(d.title, ''), d.filename), d.path || d.filename, "
+                "       'doc:' || d.id || ':created', "
+                "       json_object('file_type', d.file_type, 'file_size', d.file_size), d.created_at "
+                "FROM documents d "
+                "WHERE d.source_kind <> 'asset' "
+                "  AND COALESCE(json_extract(d.metadata, '$.hidden'), 0) = 0 "
+                "  AND COALESCE(json_extract(d.metadata, '$.asset'), 0) = 0 "
+                "  AND NOT (d.path = '/wiki/' AND d.filename IN ('index.json', 'log.md', 'overview.md')) "
+                "ORDER BY d.created_at, d.id",
+            )
+            if not had_events_table:
+                await _db.execute(
+                    "INSERT OR IGNORE INTO knowledge_base_events "
+                    "(knowledge_base_id, user_id, event_type, subject_kind, subject_title, "
+                    " event_key) "
+                    "SELECT id, user_id, 'tracking.started', 'wiki', name, "
+                    "       'kb:' || id || ':tracking-started' FROM workspace",
+                )
             await _db.commit()
         logger.info("SQLite initialized: %s", db_path)
 
@@ -690,7 +721,6 @@ class SqliteVaultFS(VaultFS):
     async def _scaffold_wiki(self, kb_id: str, name: str) -> None:
         today = date.today().isoformat()
         overview = _OVERVIEW_TEMPLATE.format(name=name, date=today)
-        log = _LOG_TEMPLATE.format(name=name, date=today)
         # Never overwrite existing local content — a rebuilt index could scaffold over real files.
         if not self._disk_file_exists("/wiki/", "overview.md"):
             await self.create_document(
@@ -699,8 +729,3 @@ class SqliteVaultFS(VaultFS):
                 metadata={"description": f"Research hub for {name}."},
             )
             self.write_to_disk("/wiki/", "overview.md", overview)
-        if not self._disk_file_exists("/wiki/", "log.md"):
-            await self.create_document(
-                kb_id, "log.md", "Log", "/wiki/", "md", log, ["log"],
-            )
-            self.write_to_disk("/wiki/", "log.md", log)

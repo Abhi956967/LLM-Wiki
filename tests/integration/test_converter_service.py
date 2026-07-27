@@ -12,6 +12,7 @@ import importlib
 import json
 import sys
 import tempfile
+import threading
 import types
 from collections.abc import MutableMapping, MutableSequence, MutableSet
 from pathlib import Path
@@ -152,6 +153,57 @@ async def test_concurrent_request_isolation(monkeypatch, converter_module):
     assert body_a["pages"][0]["content"] != body_b["pages"][0]["content"]
 
 
+async def test_capacity_response_is_retryable(monkeypatch, converter_module):
+    monkeypatch.setattr(converter_module, "MAX_CONCURRENT_EXTRACTIONS", 1)
+    monkeypatch.setattr(converter_module, "_active_extractions", 1)
+
+    resp = await _post_extract(
+        converter_module,
+        {"source_url": "https://bucket.s3.amazonaws.com/alpha.pdf", "source_ext": "pdf"},
+    )
+
+    assert resp.status_code == 503
+    assert resp.headers["retry-after"] == "1"
+    assert "capacity" in resp.json()["detail"].lower()
+
+
+async def test_cancellation_keeps_extraction_slot_until_worker_stops(
+    monkeypatch,
+    converter_module,
+    tmp_path,
+):
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_extract(_pdf_path, _output_dir):
+        started.set()
+        assert release.wait(timeout=5)
+        return []
+
+    monkeypatch.setattr(converter_module, "_extract_pages", blocking_extract)
+
+    async def run_in_slot():
+        with converter_module._extraction_slot():
+            return await converter_module._run_extraction(
+                tmp_path / "source.pdf",
+                str(tmp_path),
+                "cancelled-request",
+            )
+
+    task = asyncio.create_task(run_in_slot())
+    assert await asyncio.to_thread(started.wait, 2)
+    task.cancel()
+    await asyncio.sleep(0)
+
+    assert converter_module._active_extractions == 1
+    assert not task.done()
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert converter_module._active_extractions == 0
+
+
 async def test_office_file_converted_then_extracted(monkeypatch, converter_module):
     _install_mocks(monkeypatch, converter_module)
 
@@ -190,6 +242,133 @@ async def test_non_integer_page_count_does_not_crash(monkeypatch, converter_modu
 
     assert resp.status_code == 200
     assert resp.json()["page_count"] == 0
+
+
+async def test_extraction_json_bytes_are_capped(monkeypatch, converter_module):
+    _install_mocks(
+        monkeypatch,
+        converter_module,
+        page_payload={
+            "number of pages": 1,
+            "kids": [{"type": "paragraph", "page number": 1, "content": "text"}],
+        },
+    )
+    monkeypatch.setattr(converter_module, "MAX_EXTRACTION_JSON_BYTES", 16)
+
+    resp = await _post_extract(
+        converter_module,
+        {"source_url": "https://bucket.s3.amazonaws.com/alpha.pdf", "source_ext": "pdf"},
+    )
+
+    assert resp.status_code == 500
+
+
+async def test_extraction_element_count_is_capped(monkeypatch, converter_module):
+    _install_mocks(
+        monkeypatch,
+        converter_module,
+        page_payload={
+            "number of pages": 1,
+            "kids": [
+                {"type": "paragraph", "page number": 1, "content": "one"},
+                {"type": "paragraph", "page number": 1, "content": "two"},
+            ],
+        },
+    )
+    monkeypatch.setattr(converter_module, "MAX_EXTRACTION_ELEMENTS", 1)
+
+    resp = await _post_extract(
+        converter_module,
+        {"source_url": "https://bucket.s3.amazonaws.com/alpha.pdf", "source_ext": "pdf"},
+    )
+
+    assert resp.status_code == 500
+
+
+async def test_extraction_nested_child_count_is_capped(monkeypatch, converter_module):
+    _install_mocks(
+        monkeypatch,
+        converter_module,
+        page_payload={
+            "number of pages": 1,
+            "kids": [{
+                "type": "list",
+                "page number": 1,
+                "list items": [
+                    {"content": "one", "kids": []},
+                    {"content": "two", "kids": []},
+                ],
+            }],
+        },
+    )
+    monkeypatch.setattr(converter_module, "MAX_ELEMENT_CHILDREN", 1)
+
+    resp = await _post_extract(
+        converter_module,
+        {"source_url": "https://bucket.s3.amazonaws.com/alpha.pdf", "source_ext": "pdf"},
+    )
+
+    assert resp.status_code == 500
+
+
+async def test_extraction_per_element_text_is_capped(monkeypatch, converter_module):
+    _install_mocks(
+        monkeypatch,
+        converter_module,
+        page_payload={
+            "number of pages": 1,
+            "kids": [{"type": "paragraph", "page number": 1, "content": "12345"}],
+        },
+    )
+    monkeypatch.setattr(converter_module, "MAX_ELEMENT_TEXT_BYTES", 4)
+
+    resp = await _post_extract(
+        converter_module,
+        {"source_url": "https://bucket.s3.amazonaws.com/alpha.pdf", "source_ext": "pdf"},
+    )
+
+    assert resp.status_code == 500
+
+
+async def test_extraction_total_text_is_capped(monkeypatch, converter_module):
+    _install_mocks(
+        monkeypatch,
+        converter_module,
+        page_payload={
+            "number of pages": 1,
+            "kids": [
+                {"type": "paragraph", "page number": 1, "content": "abc"},
+                {"type": "paragraph", "page number": 1, "content": "def"},
+            ],
+        },
+    )
+    monkeypatch.setattr(converter_module, "MAX_EXTRACTED_TEXT_BYTES", 7)
+
+    resp = await _post_extract(
+        converter_module,
+        {"source_url": "https://bucket.s3.amazonaws.com/alpha.pdf", "source_ext": "pdf"},
+    )
+
+    assert resp.status_code == 500
+
+
+async def test_extraction_serialized_response_is_capped(monkeypatch, converter_module):
+    _install_mocks(
+        monkeypatch,
+        converter_module,
+        page_payload={
+            "number of pages": 1,
+            "kids": [{"type": "paragraph", "page number": 1, "content": "ok"}],
+        },
+    )
+    monkeypatch.setattr(converter_module, "MAX_EXTRACTION_RESPONSE_BYTES", 20)
+
+    resp = await _post_extract(
+        converter_module,
+        {"source_url": "https://bucket.s3.amazonaws.com/alpha.pdf", "source_ext": "pdf"},
+    )
+
+    assert resp.status_code == 500
 
 
 async def test_temp_directory_cleanup(monkeypatch, converter_module):

@@ -5,7 +5,9 @@ produce on the parsed markdown — markdown punctuation removed, block
 separation preserved, inline spans flattened.
 """
 
+import asyncio
 import socket
+import threading
 
 import pytest
 from html_parser import Parser
@@ -241,7 +243,7 @@ async def test_webclip_asset_materialization_fetches_remote_images(monkeypatch):
     )
     png_bytes = _b64.b64decode(png_1x1)
 
-    async def fake_remote(url: str):
+    async def fake_remote(url: str, max_bytes: int | None = None):
         return png_bytes, "image/png"
 
     monkeypatch.setattr(webclip_assets, "_fetch_remote_image", fake_remote)
@@ -265,7 +267,7 @@ async def test_webclip_asset_materialization_drops_remote_images_when_fetch_fail
     from services import webclip_assets
     from services.webclip_assets import materialize_webclip_assets
 
-    async def fake_remote(url: str):
+    async def fake_remote(url: str, max_bytes: int | None = None):
         return None  # paywalled / unreachable / SSRF-blocked
 
     monkeypatch.setattr(webclip_assets, "_fetch_remote_image", fake_remote)
@@ -371,16 +373,19 @@ async def test_webclip_asset_materialization_rejects_mismatched_image_bytes():
 
 
 @pytest.mark.asyncio
-async def test_webclip_asset_materialization_has_no_image_count_cap():
+async def test_webclip_asset_materialization_keeps_images_below_global_cap():
+    import base64 as _b64
+
     from html_parser.models import Image
     from services.webclip_assets import materialize_webclip_assets
 
     png_1x1 = (
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
     )
+    png_bytes = _b64.b64decode(png_1x1)
     images = [
         Image(
-            url=f"data:image/png;base64,{png_1x1}",
+            url="data:image/png;base64," + _b64.b64encode(png_bytes + bytes([i])).decode(),
             alt=f"image {i}",
             ref=f"IMG{i}",
         )
@@ -397,6 +402,178 @@ async def test_webclip_asset_materialization_has_no_image_count_cap():
     assert len(assets) == 20
     assert "llmwiki-image://" not in rewritten
     assert "![Image 19](./article.assets/image-20.png)" in rewritten
+
+
+@pytest.mark.asyncio
+async def test_webclip_asset_materialization_caps_aggregate_bytes_under_concurrency(monkeypatch):
+    from html_parser.models import Image
+    from services import webclip_assets
+
+    active_capacity = 0
+    completed_payload_bytes = 0
+    peak_capacity = 0
+    calls: list[int] = []
+    two_started = asyncio.Event()
+
+    async def concurrent_fetch(url: str, max_bytes: int):
+        nonlocal active_capacity, completed_payload_bytes, peak_capacity
+        calls.append(max_bytes)
+        payload_size = 3 if len(calls) <= 2 else max_bytes
+        active_capacity += max_bytes
+        peak_capacity = max(
+            peak_capacity,
+            completed_payload_bytes + active_capacity,
+        )
+        if len(calls) == 2:
+            two_started.set()
+        try:
+            if len(calls) <= 2:
+                await asyncio.wait_for(two_started.wait(), timeout=1)
+            return b"x" * payload_size, "image/png"
+        finally:
+            active_capacity -= max_bytes
+            completed_payload_bytes += payload_size
+
+    monkeypatch.setattr(webclip_assets, "MAX_IMAGE_BYTES", 6)
+    monkeypatch.setattr(webclip_assets, "MAX_WEBCLIP_ASSET_BYTES", 12)
+    monkeypatch.setattr(webclip_assets, "_fetch_image", concurrent_fetch)
+    images = [
+        Image(url=f"https://cdn.example/{i}.png", alt=str(i), ref=f"IMG{i}")
+        for i in range(4)
+    ]
+
+    rewritten, assets = await webclip_assets.materialize_webclip_assets(
+        "\n".join(f"![{i}](llmwiki-image://IMG{i})" for i in range(4)),
+        images,
+        "article.assets",
+    )
+
+    assert len(assets) == 3
+    assert calls == [6, 6, 6]
+    assert peak_capacity == 12
+    assert sum(len(asset.data) for asset in assets) == 12
+    assert "llmwiki-image://" not in rewritten
+
+
+@pytest.mark.asyncio
+async def test_webclip_asset_materialization_dedupes_and_caps_all_inputs_before_fetch(monkeypatch):
+    from html_parser.models import Image
+    from services import webclip_assets
+
+    fetched_urls: list[str] = []
+    scheduled_counts: list[int] = []
+    real_gather = asyncio.gather
+
+    async def recording_fetch(url: str, max_bytes: int):
+        fetched_urls.append(url)
+        return b"x", "image/png"
+
+    def counting_gather(*awaitables, **kwargs):
+        scheduled_counts.append(len(awaitables))
+        return real_gather(*awaitables, **kwargs)
+
+    monkeypatch.setattr(webclip_assets, "MAX_WEBCLIP_IMAGES", 3)
+    monkeypatch.setattr(webclip_assets, "_fetch_image", recording_fetch)
+    monkeypatch.setattr(webclip_assets.asyncio, "gather", counting_gather)
+    images = [
+        Image(url="data:image/png;base64,first", alt="first", ref="IMG1"),
+        Image(url="data:image/png;base64,duplicate", alt="duplicate", ref="IMG1"),
+        Image(url="https://cdn.example/second.png", alt="second", ref="IMG2"),
+        Image(url="data:image/png;base64,third", alt="third", ref="IMG3"),
+        Image(url="https://cdn.example/fourth.png", alt="fourth", ref="IMG4"),
+    ]
+
+    rewritten, assets = await webclip_assets.materialize_webclip_assets(
+        "\n".join(f"![{image.alt}](llmwiki-image://{image.ref})" for image in images),
+        images,
+        "article.assets",
+    )
+
+    assert fetched_urls == [
+        "data:image/png;base64,first",
+        "https://cdn.example/second.png",
+        "data:image/png;base64,third",
+    ]
+    assert scheduled_counts == [3]
+    assert len(assets) == 3
+    assert "llmwiki-image://" not in rewritten
+    assert "fourth" not in rewritten
+
+
+@pytest.mark.asyncio
+async def test_webclip_asset_materialization_fetches_duplicate_url_once_and_maps_all_refs(monkeypatch):
+    from html_parser.models import Image
+    from services import webclip_assets
+
+    fetched_urls: list[str] = []
+
+    async def recording_fetch(url: str, max_bytes: int):
+        fetched_urls.append(url)
+        return b"x", "image/png"
+
+    shared_url = "https://cdn.example/shared.png"
+    monkeypatch.setattr(webclip_assets, "MAX_WEBCLIP_IMAGES", 1)
+    monkeypatch.setattr(webclip_assets, "_fetch_image", recording_fetch)
+    images = [
+        Image(url=shared_url, alt="first", ref="IMG1"),
+        Image(url="https://cdn.example/over-cap.png", alt="over cap", ref="IMG2"),
+        Image(url=shared_url, alt="alias after cap", ref="IMG3"),
+    ]
+
+    rewritten, assets = await webclip_assets.materialize_webclip_assets(
+        "\n".join(f"![{image.alt}](llmwiki-image://{image.ref})" for image in images),
+        images,
+        "article.assets",
+    )
+
+    assert fetched_urls == [shared_url]
+    assert len(assets) == 1
+    assert assets[0].alt == "first"
+    assert rewritten.count("./article.assets/image-01.png") == 2
+    assert "alias after cap" in rewritten
+    assert "over cap" not in rewritten
+    assert "llmwiki-image://" not in rewritten
+
+
+@pytest.mark.asyncio
+async def test_webclip_asset_timeout_cancellation_releases_byte_reservation(monkeypatch):
+    from html_parser.models import Image
+    from services import webclip_assets
+
+    budgets: list[webclip_assets._AssetByteBudget] = []
+    fetch_started = asyncio.Event()
+    fetch_cancelled = asyncio.Event()
+    original_budget = webclip_assets._AssetByteBudget
+
+    class RecordingBudget(original_budget):
+        def __init__(self, limit: int):
+            super().__init__(limit)
+            budgets.append(self)
+
+    async def hanging_fetch(url: str, max_bytes: int):
+        fetch_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            fetch_cancelled.set()
+
+    monkeypatch.setattr(webclip_assets, "IMAGE_TOTAL_BUDGET", 0.01)
+    monkeypatch.setattr(webclip_assets, "_AssetByteBudget", RecordingBudget)
+    monkeypatch.setattr(webclip_assets, "_fetch_image", hanging_fetch)
+
+    rewritten, assets = await webclip_assets.materialize_webclip_assets(
+        "![hanging](llmwiki-image://IMG1)",
+        [Image(url="https://cdn.example/hanging.png", alt="hanging", ref="IMG1")],
+        "article.assets",
+    )
+
+    assert fetch_started.is_set()
+    assert fetch_cancelled.is_set()
+    assert len(budgets) == 1
+    assert budgets[0]._reserved == 0
+    assert budgets[0]._retained == 0
+    assert rewritten == ""
+    assert assets == []
 
 
 def test_webclip_path_normalization_restricts_to_webclipper_root():
@@ -424,8 +601,18 @@ def test_parser_instances_are_single_use():
 
 
 @pytest.mark.asyncio
-async def test_hosted_webclip_records_storage_size_for_markdown_artifact():
+async def test_hosted_webclip_records_storage_size_for_markdown_artifact(monkeypatch):
     from services.hosted import HostedDocumentService
+
+    main_thread = threading.get_ident()
+    parser_threads: list[int] = []
+    original_parse = Parser.parse
+
+    def recording_parse(self, *args, **kwargs):
+        parser_threads.append(threading.get_ident())
+        return original_parse(self, *args, **kwargs)
+
+    monkeypatch.setattr(Parser, "parse", recording_parse)
 
     class Tx:
         async def __aenter__(self):
@@ -501,6 +688,8 @@ async def test_hosted_webclip_records_storage_size_for_markdown_artifact():
     file_size = pool.conn.insert_args[6]
     assert isinstance(file_size, int)
     assert file_size > 0
+    assert parser_threads
+    assert all(thread_id != main_thread for thread_id in parser_threads)
 
 
 @pytest.mark.asyncio

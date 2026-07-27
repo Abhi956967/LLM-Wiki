@@ -14,8 +14,11 @@ import {
   setSelectedFolderPath,
   setSelectedKnowledgeBaseId,
 } from "@/lib/settings";
-import { isPdfTab, normalizePdfSourceUrl } from "@/lib/pdf";
+import { normalizePdfSourceUrl } from "@/lib/pdf";
 import { runPdfSaveJob } from "@/lib/pdf-save-jobs";
+import { detectActivePage, type ActivePageTab } from "@/lib/active-tab";
+import { capturePageHtml } from "@/lib/page-capture";
+import { tabMessageWithDeadline, withDeadline } from "@/lib/deadline";
 import KBPicker from "./KBPicker";
 import StatusFeedback, { type Status } from "./StatusFeedback";
 import { canonicalize } from "@/lib/url";
@@ -43,35 +46,54 @@ interface Props {
   accessToken: string | null;
 }
 
-interface TabInfo {
-  url: string;
-  title: string;
-  isPdf: boolean;
-  tabId: number;
-}
+type PageState =
+  | { status: "loading" }
+  | { status: "ready"; tab: ActivePageTab }
+  | { status: "unavailable"; message: string };
+
+export const SAVED_DESTINATION_TIMEOUT_MS = 2_000;
 
 export default function SaveForm({ apiUrl, accessToken }: Props) {
-  const [tab, setTab] = useState<TabInfo | null>(null);
+  const [page, setPage] = useState<PageState>({ status: "loading" });
   const [title, setTitle] = useState("");
   const [knowledgeBaseId, setKnowledgeBaseId] = useState<string | null>(null);
+  const [selectionReady, setSelectionReady] = useState(false);
   const [folderPath, setFolderPath] = useState("/webclipper/");
   const [showMore, setShowMore] = useState(false);
   const [existingDoc, setExistingDoc] = useState<DocumentByUrl | null>(null);
   const [checkingExisting, setCheckingExisting] = useState(false);
   const [status, setStatus] = useState<Status>({ type: "idle" });
+  const tab = page.status === "ready" ? page.tab : null;
 
   useEffect(() => {
-    detectCurrentPage();
-    getSelectedKnowledgeBaseId()
-      .then((id) => {
-        if (id) setKnowledgeBaseId((current) => current ?? id);
-      })
-      .catch(() => {
-        // Non-fatal: the picker will fall back to the first KB.
-      });
-    getSelectedFolderPath()
-      .then((path) => setFolderPath(path))
-      .catch(() => {});
+    let cancelled = false;
+    void detectCurrentPage(() => cancelled);
+    void loadSavedDestination();
+
+    async function loadSavedDestination() {
+      const [savedKnowledgeBaseId, savedFolderPath] = await Promise.all([
+        withDeadline(
+          getSelectedKnowledgeBaseId(),
+          SAVED_DESTINATION_TIMEOUT_MS,
+          "Saved knowledge base lookup timed out",
+        ).catch(() => null),
+        withDeadline(
+          getSelectedFolderPath(),
+          SAVED_DESTINATION_TIMEOUT_MS,
+          "Saved folder lookup timed out",
+        ).catch(() => "/webclipper/"),
+      ]);
+      if (cancelled) return;
+      if (savedKnowledgeBaseId) {
+        setKnowledgeBaseId((current) => current ?? savedKnowledgeBaseId);
+      }
+      setFolderPath(savedFolderPath);
+      setSelectionReady(true);
+    }
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -95,10 +117,10 @@ export default function SaveForm({ apiUrl, accessToken }: Props) {
           setFolderPath(doc.path || "/webclipper/");
           setSelectedKnowledgeBaseId(doc.knowledge_base_id).catch(() => {});
           if (doc.path) setSelectedFolderPath(doc.path).catch(() => {});
-          chrome.tabs.sendMessage(tab.tabId, {
+          tabMessageWithDeadline(tab.tabId, {
             type: "DOCUMENT_SAVED",
             documentId: doc.id,
-          }).catch(() => {
+          }, 1_500).catch(() => {
             // Content script may not be present on restricted pages.
           });
         }
@@ -116,21 +138,25 @@ export default function SaveForm({ apiUrl, accessToken }: Props) {
     };
   }, [apiUrl, accessToken, tab]);
 
-  async function detectCurrentPage() {
-    const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!activeTab?.url || !activeTab.id) return;
+  async function detectCurrentPage(isCancelled: () => boolean = () => false) {
+    if (isCancelled()) return;
+    setPage({ status: "loading" });
+    const result = await detectActivePage();
+    if (isCancelled()) return;
+    if (result.status !== "ready") {
+      setPage(result);
+      return;
+    }
 
-    const url = activeTab.url;
-    const isPdf = await isPdfTab(activeTab.id, url, activeTab.title);
-
-    setTab({ url, title: activeTab.title ?? "", isPdf, tabId: activeTab.id });
-    setTitle(activeTab.title ?? "");
+    const activeTab = result.tab;
+    setPage(result);
+    setTitle(activeTab.title);
 
     // Inject the highlighter under the activeTab grant so saved highlights
     // overlay and the user can annotate. No-op on PDFs / restricted pages.
-    if (/^https?:/.test(url) && !isPdf) {
+    if (!activeTab.isPdf) {
       chrome.scripting
-        .executeScript({ target: { tabId: activeTab.id }, files: ["content-scripts/content.js"] })
+        .executeScript({ target: { tabId: activeTab.tabId }, files: ["content-scripts/content.js"] })
         .catch(() => {});
     }
   }
@@ -156,164 +182,30 @@ export default function SaveForm({ apiUrl, accessToken }: Props) {
 
     let html: string;
     try {
-      // Run in the page so the extension's own marks/UI are stripped from
-      // the snapshot — we don't want yellow <mark> nodes or the popover
-      // floating in the saved HTML.
-      const [{ result }] = await chrome.scripting.executeScript({
-        target: { tabId: tab.tabId },
-        func: () => {
-          const MAX_IMAGES = 24;
-          const LAZY_IMAGE_SRC_ATTRIBUTES = [
-            "data-src",
-            "data-original",
-            "data-lazy-src",
-            "data-hires",
-            "data-url",
-            "data-image",
-            "data-full-url",
-          ];
-          const LAZY_IMAGE_SRCSET_ATTRIBUTES = [
-            "data-srcset",
-            "data-lazy-srcset",
-          ];
-
-          const clone = document.documentElement.cloneNode(true) as HTMLElement;
-          clone.querySelectorAll(
-            ".llmwiki-pill, .llmwiki-popover, .llmwiki-toast, #llmwiki-highlight-style",
-          ).forEach((el) => el.remove());
-          clone.querySelectorAll("mark.llmwiki-hl").forEach((mark) => {
-            const parent = mark.parentNode;
-            if (!parent) return;
-            while (mark.firstChild) parent.insertBefore(mark.firstChild, mark);
-            parent.removeChild(mark);
-          });
-
-          const liveImages = Array.from(document.images);
-          const cloneImages = Array.from(clone.querySelectorAll("img"));
-          const candidates = liveImages
-            .map((img, index) => {
-              const { width, height } = imageDimensions(img);
-              const src = candidateImageUrl(img);
-              const inArticle = !!img.closest("article, main, [role='main']");
-              const hasKnownSize = width > 0 && height > 0;
-              const area = hasKnownSize ? width * height : 120_000;
-              return {
-                index,
-                src,
-                width,
-                height,
-                inArticle,
-                hasKnownSize,
-                score: (inArticle ? 10_000_000 : 0) + area,
-              };
-            })
-            .filter((item) => {
-              if (!item.src || item.src.startsWith("data:") || item.src.startsWith("blob:")) return false;
-              if (!/^https?:\/\//i.test(item.src)) return false;
-              if (item.width >= 80 && item.height >= 50) return true;
-              return item.inArticle && !item.hasKnownSize;
-            })
-            .sort((a, b) => b.score - a.score)
-            .slice(0, MAX_IMAGES);
-
-          // No client-side image fetching: resolve each image to its best
-          // absolute URL and let the API's server-side fetcher rehost it.
-          for (const item of candidates) {
-            const cloneImg = cloneImages[item.index];
-            if (!cloneImg) continue;
-            cloneImg.setAttribute("src", item.src);
-            cloneImg.removeAttribute("srcset");
-            cloneImg.removeAttribute("sizes");
-            if (item.width) cloneImg.setAttribute("width", String(item.width));
-            if (item.height) cloneImg.setAttribute("height", String(item.height));
-          }
-
-          return clone.outerHTML;
-
-          function absoluteImageUrl(value: string | null | undefined): string {
-            if (!value) return "";
-            const trimmed = value.trim();
-            if (!trimmed) return "";
-            try {
-              return new URL(trimmed, location.href).toString();
-            } catch {
-              return trimmed;
-            }
-          }
-
-          function pictureSourceUrl(img: HTMLImageElement): string {
-            const picture = img.closest("picture");
-            if (!picture) return "";
-            for (const source of Array.from(picture.querySelectorAll("source"))) {
-              const srcset = source.getAttribute("srcset") || source.getAttribute("data-srcset") || "";
-              const best = largestSrcsetUrl(srcset);
-              if (best) return best;
-              const src = absoluteImageUrl(source.getAttribute("src"));
-              if (src) return src;
-            }
-            return "";
-          }
-
-          function candidateImageUrl(img: HTMLImageElement): string {
-            const directCandidates = [
-              img.currentSrc,
-              img.getAttribute("src"),
-              img.src,
-              largestSrcsetUrl(img.getAttribute("srcset") || ""),
-              pictureSourceUrl(img),
-              ...LAZY_IMAGE_SRC_ATTRIBUTES.map((attr) => img.getAttribute(attr)),
-              ...LAZY_IMAGE_SRCSET_ATTRIBUTES.map((attr) => largestSrcsetUrl(img.getAttribute(attr) || "")),
-            ];
-
-            for (const candidate of directCandidates) {
-              const src = absoluteImageUrl(candidate);
-              if (src) return src;
-            }
-            return "";
-          }
-
-          function imageDimensions(img: HTMLImageElement): { width: number; height: number } {
-            const rect = img.getBoundingClientRect();
-            const widthAttr = Number.parseInt(img.getAttribute("width") || "", 10);
-            const heightAttr = Number.parseInt(img.getAttribute("height") || "", 10);
-            return {
-              width: Math.round(rect.width || img.naturalWidth || widthAttr || 0),
-              height: Math.round(rect.height || img.naturalHeight || heightAttr || 0),
-            };
-          }
-
-          function largestSrcsetUrl(srcset: string): string {
-            let bestUrl = "";
-            let bestWidth = 0;
-            for (const raw of srcset.split(",")) {
-              const parts = raw.trim().split(/\s+/);
-              if (!parts[0]) continue;
-              const width = parts[1]?.endsWith("w")
-                ? Number.parseInt(parts[1], 10)
-                : 0;
-              if (!bestUrl || width > bestWidth) {
-                bestUrl = parts[0];
-                bestWidth = width;
-              }
-            }
-            try {
-              return bestUrl ? new URL(bestUrl, location.href).toString() : "";
-            } catch {
-              return bestUrl;
-            }
-          }
-        },
-      });
-      html = result as string;
-    } catch {
-      throw new Error("Could not extract page content. Try refreshing the page.");
+      const [{ result }] = await withDeadline(
+        chrome.scripting.executeScript({
+          target: { tabId: tab.tabId },
+          func: capturePageHtml,
+        }),
+        15_000,
+        "Page extraction did not finish",
+      );
+      if (typeof result !== "string" || !result) {
+        throw new Error("The page returned no content.");
+      }
+      html = result;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "Unknown extraction error";
+      throw new Error(`Could not extract page content. ${detail}`);
     }
 
     let highlights: Highlight[] = [];
     try {
-      const reply = await chrome.tabs.sendMessage(tab.tabId, {
-        type: "GET_PAGE_HIGHLIGHTS",
-      });
+      const reply = await tabMessageWithDeadline<{ highlights?: unknown }>(
+        tab.tabId,
+        { type: "GET_PAGE_HIGHLIGHTS" },
+        1_500,
+      );
       if (reply?.highlights && Array.isArray(reply.highlights)) {
         highlights = reply.highlights as Highlight[];
       }
@@ -334,16 +226,18 @@ export default function SaveForm({ apiUrl, accessToken }: Props) {
       highlights: highlights.length ? highlights : undefined,
     });
 
-    // Tell the content script about the new doc id so subsequent highlight
-    // edits in this same tab can persist via PATCH /highlights without a reload.
-    try {
-      await chrome.tabs.sendMessage(tab.tabId, {
+    // Saving is already complete. Do not hold the popup open for this
+    // best-effort content-script refresh.
+    void tabMessageWithDeadline(
+      tab.tabId,
+      {
         type: "DOCUMENT_SAVED",
         documentId: result.id,
-      });
-    } catch {
+      },
+      1_500,
+    ).catch(() => {
       // Page might be closed or content script unavailable — fine.
-    }
+    });
 
     setExistingDoc({
       id: result.id,
@@ -405,7 +299,7 @@ export default function SaveForm({ apiUrl, accessToken }: Props) {
     }
   }
 
-  if (!tab) {
+  if (page.status === "loading") {
     return (
       <div className="flex items-center justify-center py-6">
         <div className="h-4 w-4 animate-spin rounded-full border-2 border-zinc-200 border-t-zinc-800" />
@@ -413,9 +307,30 @@ export default function SaveForm({ apiUrl, accessToken }: Props) {
     );
   }
 
+  if (page.status === "unavailable") {
+    return (
+      <div className="space-y-3 py-2">
+        <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800">
+          {page.message}
+        </div>
+        <button
+          onClick={() => void detectCurrentPage()}
+          className="h-9 w-full rounded-md bg-zinc-950 px-3 text-xs font-medium text-white hover:bg-zinc-800"
+        >
+          Retry active page
+        </button>
+      </div>
+    );
+  }
+
   const isSaving = status.type === "saving";
   const isAlreadySaved = !!existingDoc;
-  const canSave = knowledgeBaseId && !isSaving && !isAlreadySaved && status.type !== "success";
+  const canSave = !!knowledgeBaseId
+    && selectionReady
+    && !checkingExisting
+    && !isSaving
+    && !isAlreadySaved
+    && status.type !== "success";
 
   return (
     <div className="space-y-3">
@@ -434,12 +349,16 @@ export default function SaveForm({ apiUrl, accessToken }: Props) {
       </div>
 
       {/* KB picker */}
-      <KBPicker
-        apiUrl={apiUrl}
-        accessToken={accessToken}
-        value={knowledgeBaseId}
-        onChange={handleKnowledgeBaseChange}
-      />
+      {selectionReady ? (
+        <KBPicker
+          apiUrl={apiUrl}
+          accessToken={accessToken}
+          value={knowledgeBaseId}
+          onChange={handleKnowledgeBaseChange}
+        />
+      ) : (
+        <div className="py-1 text-xs text-zinc-500">Loading saved destination...</div>
+      )}
 
       {/* Folder/More section disabled for v0 — re-enable when folder picker is ready.
       <div className="rounded-md border border-zinc-200 bg-zinc-50/60">

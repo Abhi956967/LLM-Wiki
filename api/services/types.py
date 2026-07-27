@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Literal
 from uuid import UUID
 
+from domain.quiz_lint import validate_quiz_content
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 MAX_TEXT_CONTENT_BYTES = 10 * 1024 * 1024
@@ -57,6 +58,7 @@ class CreateNote(BaseModel):
     content: str = Field(default="", max_length=MAX_TEXT_CONTENT_BYTES)
 
     _content_size = field_validator("content")(_validate_text_content_size)
+    _quiz_blocks = field_validator("content")(validate_quiz_content)
 
 
 class HighlightAnchor(BaseModel):
@@ -188,6 +190,7 @@ class UpdateContent(BaseModel):
     content: str = Field(max_length=MAX_TEXT_CONTENT_BYTES)
 
     _content_size = field_validator("content")(_validate_text_content_size)
+    _quiz_blocks = field_validator("content")(validate_quiz_content)
 
 
 class UpdateMetadata(BaseModel):

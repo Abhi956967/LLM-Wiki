@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 import logging
 import re
@@ -21,6 +23,36 @@ from .parsers import parse_frontmatter, title_from_filename
 from .types import MAX_TEXT_CONTENT_BYTES
 
 logger = logging.getLogger(__name__)
+
+DB_ACQUIRE_TIMEOUT_SECONDS = 10.0
+
+
+async def _acquire_connection(pool):
+    """Bound pool waits so request handlers fail instead of hanging forever."""
+    try:
+        parameters = inspect.signature(pool.acquire).parameters.values()
+        supports_timeout = any(
+            parameter.name == "timeout"
+            or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+    except (TypeError, ValueError):
+        supports_timeout = False
+
+    if supports_timeout:
+        return await pool.acquire(timeout=DB_ACQUIRE_TIMEOUT_SECONDS)
+    return await asyncio.wait_for(
+        pool.acquire(),
+        timeout=DB_ACQUIRE_TIMEOUT_SECONDS,
+    )
+
+
+def _parse_web_clip(html: str, url: str, highlights: list[dict]):
+    """Run the synchronous HTML parser from a worker thread."""
+    from html_parser import Parser
+
+    parser = Parser(html, url=url, content_only=True)
+    return parser.parse(highlights=highlights)
 
 
 class HostedUserService(UserService):
@@ -68,11 +100,19 @@ class HostedUserService(UserService):
         }
 
 
+# Mirrors the web's lesson definition (wikiTree.ts): wiki pages minus the structural hub/log/index.
+_LESSON_FILTER = (
+    "d.knowledge_base_id = kb.id AND d.path LIKE '/wiki/%' AND NOT d.archived "
+    "AND (d.path || d.filename) NOT IN ('/wiki/overview.md', '/wiki/log.md', '/wiki/index.json')"
+)
+
 _KB_LIST_QUERY = (
     "SELECT kb.id, kb.user_id, kb.name, kb.slug, kb.description, kb.kind, "
     "kb.created_at, kb.updated_at, "
     "(SELECT COUNT(*) FROM documents d WHERE d.knowledge_base_id = kb.id AND d.path NOT LIKE '/wiki/%' AND NOT d.archived AND COALESCE((d.metadata->>'hidden')::boolean, false) = false) AS source_count, "
-    "(SELECT COUNT(*) FROM documents d WHERE d.knowledge_base_id = kb.id AND d.path LIKE '/wiki/%' AND NOT d.archived) AS wiki_page_count "
+    "(SELECT COUNT(*) FROM documents d WHERE d.knowledge_base_id = kb.id AND d.path LIKE '/wiki/%' AND NOT d.archived) AS wiki_page_count, "
+    f"(SELECT COUNT(*) FROM documents d WHERE {_LESSON_FILTER}) AS lesson_count, "
+    f"(SELECT COUNT(*) FROM documents d WHERE {_LESSON_FILTER} AND d.metadata->'course'->>'status' = 'complete') AS lessons_completed "
     "FROM knowledge_bases kb"
 )
 
@@ -88,18 +128,7 @@ This wiki tracks research on {name}. No sources have been ingested yet.
 
 ## Key Findings
 
-No sources ingested yet — add your first source to get started.
-
-## Recent Updates
-
-No activity yet.\
-"""
-
-_LOG_TEMPLATE = """\
-Chronological record of ingests, queries, and maintenance passes.
-
-## [{date}] created | Wiki Created
-- Initialized wiki: {name}\
+No sources ingested yet — add your first source to get started.\
 """
 
 
@@ -164,7 +193,7 @@ class HostedKBService(KBService):
             raise HTTPException(status_code=503, detail="We've reached our user capacity for now. Please try again later.")
 
     async def _insert_kb(self, name: str, slug: str, description: str | None, kind: str = "wiki") -> dict:
-        conn = await self.pool.acquire()
+        conn = await _acquire_connection(self.pool)
         try:
             async with conn.transaction():
                 current_name = name
@@ -196,12 +225,6 @@ class HostedKBService(KBService):
             ["overview", "wiki"],
             today,
             json.dumps({"description": f"Research hub for {name}."}),
-        )
-        await self.pool.execute(
-            "INSERT INTO documents (knowledge_base_id, user_id, filename, title, path, "
-            "file_type, status, content, tags, version, sort_order) "
-            "VALUES ($1, $2, 'log.md', 'Log', '/wiki/', 'md', 'ready', $3, $4, 0, 100)",
-            kb_id, self.user_id, _LOG_TEMPLATE.format(name=name, date=today), ["log"],
         )
 
     async def update_sharing(
@@ -388,7 +411,7 @@ class HostedDocumentService(DocumentService):
 
         await self._validate_kb(kb_id)
 
-        meta = parse_frontmatter(content)
+        meta = await asyncio.to_thread(parse_frontmatter, content)
         title = meta.get("title", "").strip() or title_from_filename(filename)
         tags = [str(t) for t in meta.get("tags", []) if t is not None] if isinstance(meta.get("tags"), list) else []
 
@@ -400,7 +423,9 @@ class HostedDocumentService(DocumentService):
         if existing:
             raise HTTPException(status_code=409, detail=f"'{filename}' already exists at {path}")
 
-        conn = await self.pool.acquire()
+        chunks = await asyncio.to_thread(chunk_text, content) if content else []
+
+        conn = await _acquire_connection(self.pool)
         try:
             async with conn.transaction():
                 await conn.execute(
@@ -415,8 +440,7 @@ class HostedDocumentService(DocumentService):
                     f"RETURNING {_DOC_COLUMNS}",
                     kb_id, self.user_id, filename, path, title, content_size, content, tags,
                 )
-                if content:
-                    chunks = chunk_text(content)
+                if chunks:
                     await store_chunks(conn, str(row["id"]), self.user_id, str(kb_id), chunks)
         finally:
             await self.pool.release(conn)
@@ -426,13 +450,15 @@ class HostedDocumentService(DocumentService):
         self, kb_id: str, url: str, title: str, html: str,
         highlights: list[dict] | None = None, path: str = "/webclipper/",
     ) -> dict:
-        from html_parser import Parser
-
         await self._validate_kb(kb_id)
         path = _normalize_webclip_path(path)
 
-        parser = Parser(html, url=url, content_only=True)
-        result = parser.parse(highlights=highlights or [])
+        result = await asyncio.to_thread(
+            _parse_web_clip,
+            html,
+            url,
+            highlights or [],
+        )
 
         existing_preview = await self.pool.fetchrow(
             "SELECT id::text, filename FROM documents "
@@ -456,6 +482,7 @@ class HostedDocumentService(DocumentService):
         )
         markdown_size = len((markdown or "").encode("utf-8"))
         file_size = markdown_size + sum(len(asset.data) for asset in assets)
+        chunks = await asyncio.to_thread(chunk_text, markdown) if markdown else []
         # Best-effort fast-fail for obvious quota errors. The in-transaction
         # check below runs under the advisory lock and is authoritative.
         await self._check_storage_available(file_size)
@@ -480,7 +507,7 @@ class HostedDocumentService(DocumentService):
                 )
 
         old_asset_ids: list[str] = []
-        conn = await self.pool.acquire()
+        conn = await _acquire_connection(self.pool)
         try:
             async with conn.transaction():
                 await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", self.user_id)
@@ -561,7 +588,6 @@ class HostedDocumentService(DocumentService):
                             **asset.metadata(),
                         }),
                     )
-                chunks = chunk_text(markdown) if markdown else []
                 if chunks:
                     await store_chunks(conn, str(row["id"]), self.user_id, str(kb_id), chunks)
                 else:
@@ -641,7 +667,7 @@ class HostedDocumentService(DocumentService):
         self, doc_id: str, highlights: list[dict],
         expected_version: int | None = None,
     ) -> dict | None:
-        conn = await self.pool.acquire()
+        conn = await _acquire_connection(self.pool)
         try:
             async with conn.transaction():
                 # Fetch + lock the doc row so we have OLD highlights inside
@@ -702,7 +728,7 @@ class HostedDocumentService(DocumentService):
         if not new_id:
             return None
 
-        conn = await self.pool.acquire()
+        conn = await _acquire_connection(self.pool)
         try:
             async with conn.transaction():
                 row = await conn.fetchrow(
@@ -760,7 +786,7 @@ class HostedDocumentService(DocumentService):
     ) -> dict | None:
         """Atomic single-entry delete by `id`. Idempotent: deleting an absent
         id is a no-op (returns the current state with version unchanged)."""
-        conn = await self.pool.acquire()
+        conn = await _acquire_connection(self.pool)
         try:
             async with conn.transaction():
                 row = await conn.fetchrow(
@@ -924,7 +950,9 @@ class HostedDocumentService(DocumentService):
         if content_size > MAX_TEXT_CONTENT_BYTES:
             raise HTTPException(status_code=413, detail="Text content exceeds the 10 MiB limit")
 
-        conn = await self.pool.acquire()
+        chunks = await asyncio.to_thread(chunk_text, content) if content else []
+
+        conn = await _acquire_connection(self.pool)
         try:
             async with conn.transaction():
                 await conn.execute(
@@ -950,7 +978,6 @@ class HostedDocumentService(DocumentService):
                     content, content_size, doc_id, self.user_id,
                 )
 
-                chunks = chunk_text(content) if content else []
                 await store_chunks(
                     conn, str(doc_id), self.user_id, current["kb_id"], chunks,
                 )
@@ -1010,7 +1037,7 @@ class HostedDocumentService(DocumentService):
             # advisory lock around the SELECT MAX/UPDATE pair. Easiest: build
             # a fresh SQL string that adds the document_number assignment.
 
-            conn = await self.pool.acquire()
+            conn = await _acquire_connection(self.pool)
             try:
                 async with conn.transaction():
                     # Verify ownership of the target KB INSIDE the

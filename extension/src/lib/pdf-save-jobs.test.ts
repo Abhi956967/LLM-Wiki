@@ -78,4 +78,45 @@ describe("runPdfSaveJob", () => {
     );
     expect(deps.messages).toEqual([{ type: ENSURE_PDF_SAVE_CONTEXT }]);
   });
+
+  it("bounds a job that reports running forever", async () => {
+    let elapsed = 0;
+    const deps: PdfSaveJobClientDependencies = {
+      createJobId: () => "pdf-job-timeout",
+      now: () => elapsed,
+      jobTimeoutMs: 1_000,
+      messageTimeoutMs: 100,
+      wait: vi.fn(async (milliseconds) => {
+        elapsed += milliseconds;
+      }),
+      sendMessage: vi.fn(async (message: unknown) => {
+        const type = (message as { type?: string }).type;
+        if (type === ENSURE_PDF_SAVE_CONTEXT) return { ready: true };
+        if (type === START_PDF_SAVE) return { accepted: true };
+        return { state: "running" };
+      }),
+    };
+
+    await expect(runPdfSaveJob(request, deps)).rejects.toThrow(
+      "PDF save timed out after 1 minute",
+    );
+  });
+
+  it("bounds a context message that never settles", async () => {
+    vi.useFakeTimers();
+    const deps: PdfSaveJobClientDependencies = {
+      createJobId: () => "pdf-job-message-timeout",
+      wait: vi.fn(async () => undefined),
+      messageTimeoutMs: 20,
+      sendMessage: vi.fn(() => new Promise<never>(() => {})),
+    };
+    try {
+      const result = runPdfSaveJob(request, deps);
+      const expectation = expect(result).rejects.toThrow("PDF save context did not respond");
+      await vi.advanceTimersByTimeAsync(20);
+      await expectation;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

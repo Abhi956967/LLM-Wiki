@@ -1,10 +1,10 @@
 """HTTP boundary checks for the unauthenticated, single-user local API.
 
-Local mode deliberately has no bearer-token authentication.  Keep it safe for
+Local mode deliberately has no bearer-token authentication. Keep it safe for
 that deployment model by accepting only loopback Host headers and by refusing
-browser writes from origins other than the local web UI or our browser
-extension.  Requests without an Origin remain valid for non-browser clients
-such as the CLI and MCP integrations.
+browser writes from origins other than the local web UI or explicitly trusted
+browser-extension IDs. Requests without an Origin remain valid for non-browser
+clients such as the CLI and MCP integrations.
 """
 
 from __future__ import annotations
@@ -73,8 +73,30 @@ def _http_origin_key(value: str) -> tuple[str, str, int] | None:
     return scheme, parsed.hostname.lower(), port or (443 if scheme == "https" else 80)
 
 
-def is_allowed_local_origin(origin: str, app_origin: str) -> bool:
-    """Allow the configured web UI and installed Chrome/Firefox extensions."""
+def normalize_extension_origins(origins: tuple[str, ...]) -> frozenset[str]:
+    """Keep only well-formed, serialized extension origins."""
+    return frozenset(
+        origin
+        for origin in origins
+        if _EXTENSION_ORIGIN_RE.fullmatch(origin) is not None
+    )
+
+
+def extension_origin_regex(origins: tuple[str, ...]) -> str:
+    """Build an exact CORS regex for the configured extension IDs."""
+    normalized = normalize_extension_origins(origins)
+    if not normalized:
+        # A never-matching expression is safer than reverting to all IDs.
+        return r"(?!)"
+    return "(?:" + "|".join(re.escape(origin) for origin in sorted(normalized)) + ")"
+
+
+def is_allowed_local_origin(
+    origin: str,
+    app_origin: str,
+    extension_origins: tuple[str, ...] = (),
+) -> bool:
+    """Allow the configured web UI and explicitly trusted extension IDs."""
     origin_key = _http_origin_key(origin)
     app_origin_key = _http_origin_key(app_origin)
     if (
@@ -83,15 +105,21 @@ def is_allowed_local_origin(origin: str, app_origin: str) -> bool:
         and app_origin_key[1] in LOOPBACK_HOSTS
     ):
         return True
-    return _EXTENSION_ORIGIN_RE.fullmatch(origin) is not None
+    return origin in normalize_extension_origins(extension_origins)
 
 
 class LocalHTTPBoundaryMiddleware:
     """Protect local mode from DNS rebinding and cross-site browser writes."""
 
-    def __init__(self, app: ASGIApp, app_origin: str) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        app_origin: str,
+        extension_origins: tuple[str, ...] = (),
+    ) -> None:
         self.app = app
         self.app_origin = app_origin
+        self.extension_origins = extension_origins
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -116,7 +144,11 @@ class LocalHTTPBoundaryMiddleware:
             ]
             if len(origin_values) > 1 or (
                 origin_values
-                and not is_allowed_local_origin(origin_values[0], self.app_origin)
+                and not is_allowed_local_origin(
+                    origin_values[0],
+                    self.app_origin,
+                    self.extension_origins,
+                )
             ):
                 response = PlainTextResponse("Origin not allowed", status_code=403)
                 await response(scope, receive, send)
