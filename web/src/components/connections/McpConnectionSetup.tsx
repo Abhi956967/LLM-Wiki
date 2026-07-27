@@ -96,6 +96,10 @@ const CLIENTS: ClientDefinition[] = [
   },
 ]
 
+export function getMcpClientDefinition(id: McpClient): ClientDefinition {
+  return CLIENTS.find((item) => item.id === id) ?? CLIENTS[0]
+}
+
 async function writeClipboard(value: string): Promise<void> {
   if (navigator.clipboard?.writeText) {
     try {
@@ -238,6 +242,11 @@ export function McpConnectionSetup({
         )}
 
         <div className="space-y-5">
+          {!showClientHeading && client.note && (
+            <p className="text-xs leading-relaxed text-muted-foreground/70">
+              {client.note}
+            </p>
+          )}
           <CopyBlock
             label={client.configLabel}
             value={client.configValue}

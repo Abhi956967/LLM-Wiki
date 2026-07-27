@@ -2,7 +2,11 @@
 
 import * as React from 'react'
 import { PlugZap } from 'lucide-react'
-import { McpConnectionSetup } from '@/components/connections/McpConnectionSetup'
+import {
+  getMcpClientDefinition,
+  McpConnectionSetup,
+  type McpClient,
+} from '@/components/connections/McpConnectionSetup'
 import {
   Sheet,
   SheetContent,
@@ -21,6 +25,9 @@ export function openMcpConnectionDock() {
 
 export function McpConnectionDock({ wikiName }: { wikiName?: string }) {
   const [open, setOpen] = React.useState(false)
+  const [activeClient, setActiveClient] = React.useState<McpClient>('claude')
+  const client = getMcpClientDefinition(activeClient)
+  const sheetTitle = activeClient === 'other' ? 'Connect another client' : `Connect ${client.name}`
 
   React.useEffect(() => {
     const handleOpen = () => setOpen(true)
@@ -52,13 +59,15 @@ export function McpConnectionDock({ wikiName }: { wikiName?: string }) {
       </SheetTrigger>
       <SheetContent className="w-[calc(100%-1rem)] max-w-[30rem] gap-0 overflow-y-auto data-[state=closed]:duration-150 data-[state=open]:duration-200 sm:max-w-[30rem]">
         <SheetHeader className="border-b border-border px-5 py-4 pr-12">
-          <SheetTitle>Connect AI</SheetTitle>
-          <SheetDescription>
-            Link an AI client to read and write this wiki.
-          </SheetDescription>
+          <SheetTitle>{sheetTitle}</SheetTitle>
+          <SheetDescription>{client.shortDescription}</SheetDescription>
         </SheetHeader>
         <div className="px-5 py-4">
-          <McpConnectionSetup wikiName={wikiName} />
+          <McpConnectionSetup
+            wikiName={wikiName}
+            showClientHeading={false}
+            onClientChange={setActiveClient}
+          />
         </div>
       </SheetContent>
     </Sheet>

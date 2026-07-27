@@ -55,7 +55,7 @@ function TimelineSkeleton() {
     <div className="mt-12" aria-label="Loading recent changes">
       <div className="mb-3 h-3 w-14 rounded bg-muted/60" />
       {[0, 1, 2, 3].map((index) => (
-        <div key={index} className="flex items-center gap-4 border-b border-border/70 py-3.5">
+        <div key={index} className="flex items-center gap-4 py-1">
           <div className="h-3 w-11 rounded bg-muted/50" />
           <div className="size-7 rounded-full bg-muted/50" />
           <div className="h-3 rounded bg-muted/50" style={{ width: `${42 + index * 7}%` }} />
@@ -126,27 +126,29 @@ function TimelineRow(props: {
   const standalone = event.subject_kind === 'wiki'
 
   return (
-    <div className="grid grid-cols-[3.25rem_1.75rem_minmax(0,1fr)] items-start gap-3 border-b border-border/70 py-3.5 last:border-b-0 sm:grid-cols-[3.75rem_1.75rem_minmax(0,1fr)]">
+    <div className="grid grid-cols-[3.25rem_1.25rem_minmax(0,1fr)] items-baseline gap-2.5 py-1 sm:grid-cols-[3.75rem_1.25rem_minmax(0,1fr)]">
       <time
         dateTime={event.occurred_at}
-        className="pt-1 text-[11px] tabular-nums text-muted-foreground/55"
+        className="text-[11px] tabular-nums text-muted-foreground/55"
       >
         {formatActivityTime(event.occurred_at)}
       </time>
-      <span className="grid size-7 place-items-center rounded-full bg-muted/55 text-muted-foreground">
+      <span className="flex items-center self-center text-muted-foreground/60">
         <EventGlyph event={event} />
       </span>
-      <div className="min-w-0 pt-0.5 text-[13px] leading-6">
+      <div className="flex min-w-0 items-baseline gap-1.5 text-[13px] leading-6">
         {standalone ? (
           <span className="text-foreground/80">{verb}</span>
         ) : (
           <>
-            <span className="mr-1.5 text-muted-foreground">{verb}</span>
-            <SubjectLink {...props} />
+            <span className="shrink-0 text-muted-foreground">{verb}</span>
+            <span className="min-w-0 truncate">
+              <SubjectLink {...props} />
+            </span>
           </>
         )}
         {countLabel && (
-          <span className="ml-2 whitespace-nowrap text-[11px] text-muted-foreground/45">
+          <span className="shrink-0 whitespace-nowrap text-[11px] text-muted-foreground/45">
             {countLabel}
           </span>
         )}
@@ -204,12 +206,12 @@ export function RecentChanges({
             </p>
           </div>
         ) : (
-          <div className="mt-12 space-y-10">
+          <div className="mt-8 space-y-5">
             {groups.map((group) => (
               <section key={group.key} aria-labelledby={`activity-${group.key}`}>
                 <h2
                   id={`activity-${group.key}`}
-                  className="mb-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-muted-foreground/55"
+                  className="mb-0.5 text-[10px] font-semibold uppercase tracking-[0.1em] text-muted-foreground/55"
                 >
                   {group.label}
                 </h2>
