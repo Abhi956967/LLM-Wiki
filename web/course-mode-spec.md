@@ -4,7 +4,7 @@ A course is a **mode of the existing wiki engine**, not a new app. Same renderer
 
 ## V0 job
 
-Render a course as markdown and **make progress legible.** That is the whole of V0. Checkpoints/quizzes and highlights/notes are specified but deliberately deferred (see Scope in PRODUCT.md).
+Render a course as markdown and **make progress legible.** That is the whole of V0. Quizzes and highlights/notes are specified but deliberately deferred (see Scope in PRODUCT.md).
 
 ## Structure on disk = course structure
 
@@ -61,4 +61,4 @@ Near-monochrome zinc. The **only color is the green completion check**; primary 
 2. **Recursive `buildTreeFromDocs`** in `web/src/components/kb/KBDetail.tsx` — folders → Part/Lesson, rail + status glyphs from frontmatter, soft locks. Highest payoff, most unknowns; derisk first.
 3. **Reading tracker + completion** in `WikiContent` — section checkmarks on scroll, Mark-complete writes frontmatter, sidebar/overall progress derive from it.
 
-"Update the formatting" mostly means *use the existing `WikiContent` renderer* and tune prose styles, not rebuild markup. Out of scope for V0: checkpoint block renderer, notes/highlights, grading loop.
+"Update the formatting" mostly means *use the existing `WikiContent` renderer* and tune prose styles, not rebuild markup. Out of scope for V0: quiz block renderer, notes/highlights, grading loop.

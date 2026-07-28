@@ -8,9 +8,10 @@ from datetime import date
 from pathlib import Path
 
 import aiosqlite
-
 from services.chunker import chunk_text, store_chunks_sqlite
-from .base import VaultFS, DuplicateDocumentError
+
+from .base import DuplicateDocumentError, VaultFS
+from .highlights import append_reply, find_highlight, parse_highlights_value
 
 logger = logging.getLogger(__name__)
 
@@ -31,18 +32,7 @@ This wiki tracks research on {name}. No sources have been ingested yet.
 
 ## Key Findings
 
-No sources ingested yet - add your first source to get started.
-
-## Recent Updates
-
-No activity yet.\
-"""
-
-_LOG_TEMPLATE = """\
-Chronological record of ingests, queries, and maintenance passes.
-
-## [{date}] created | Wiki Created
-- Initialized wiki: {name}\
+No sources ingested yet - add your first source to get started.\
 """
 
 
@@ -93,7 +83,49 @@ class SqliteVaultFS(VaultFS):
         await _db.execute("PRAGMA journal_mode=WAL")
         await _db.execute("PRAGMA foreign_keys=ON")
         if _SCHEMA_PATH.exists():
+            events_table = await _db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'knowledge_base_events'",
+            )
+            had_events_table = await events_table.fetchone() is not None
             await _db.executescript(_SCHEMA_PATH.read_text(encoding='utf-8'))
+
+            # Existing local workspaces have exact creation facts worth
+            # preserving. updated_at is not reliable edit history, so no
+            # historical update events are synthesized.
+            await _db.execute(
+                "INSERT OR IGNORE INTO knowledge_base_events "
+                "(knowledge_base_id, user_id, event_type, subject_kind, subject_title, "
+                " event_key, occurred_at) "
+                "SELECT id, user_id, 'wiki.created', 'wiki', name, "
+                "       'kb:' || id || ':created', created_at FROM workspace",
+            )
+            await _db.execute(
+                "INSERT OR IGNORE INTO knowledge_base_events "
+                "(knowledge_base_id, user_id, event_type, subject_kind, document_id, "
+                " document_number, document_version, subject_title, subject_path, "
+                " event_key, metadata, occurred_at) "
+                "SELECT (SELECT id FROM workspace LIMIT 1), d.user_id, "
+                "       CASE WHEN d.source_kind = 'wiki' THEN 'page.created' ELSE 'source.added' END, "
+                "       CASE WHEN d.source_kind = 'wiki' THEN 'wiki_page' ELSE 'source' END, "
+                "       d.id, d.document_number, d.version, "
+                "       COALESCE(NULLIF(d.title, ''), d.filename), d.path || d.filename, "
+                "       'doc:' || d.id || ':created', "
+                "       json_object('file_type', d.file_type, 'file_size', d.file_size), d.created_at "
+                "FROM documents d "
+                "WHERE d.source_kind <> 'asset' "
+                "  AND COALESCE(json_extract(d.metadata, '$.hidden'), 0) = 0 "
+                "  AND COALESCE(json_extract(d.metadata, '$.asset'), 0) = 0 "
+                "  AND NOT (d.path = '/wiki/' AND d.filename IN ('index.json', 'log.md', 'overview.md')) "
+                "ORDER BY d.created_at, d.id",
+            )
+            if not had_events_table:
+                await _db.execute(
+                    "INSERT OR IGNORE INTO knowledge_base_events "
+                    "(knowledge_base_id, user_id, event_type, subject_kind, subject_title, "
+                    " event_key) "
+                    "SELECT id, user_id, 'tracking.started', 'wiki', name, "
+                    "       'kb:' || id || ':tracking-started' FROM workspace",
+                )
             await _db.commit()
         logger.info("SQLite initialized: %s", db_path)
 
@@ -213,6 +245,29 @@ class SqliteVaultFS(VaultFS):
         rows = _rows_to_dicts(cursor, await cursor.fetchall())
         return rows[0] if rows else None
 
+    async def get_document_metadata(self, kb_id: str, filename: str, dir_path: str) -> dict | None:
+        db = self._db_or_raise()
+        cursor = await db.execute(
+            "SELECT id, user_id, filename, title, path, tags, version, file_type, "
+            "page_count, highlights, metadata, date, created_at, updated_at "
+            "FROM documents WHERE filename = ? AND path = ? AND status != 'failed'",
+            (filename, dir_path),
+        )
+        rows = _rows_to_dicts(cursor, await cursor.fetchall())
+        return rows[0] if rows else None
+
+    async def find_document_metadata_by_name(self, kb_id: str, name: str) -> dict | None:
+        db = self._db_or_raise()
+        name_lower = name.lower()
+        cursor = await db.execute(
+            "SELECT id, user_id, filename, title, path, tags, version, file_type, "
+            "page_count, highlights, metadata, date, created_at, updated_at "
+            "FROM documents WHERE (lower(filename) = ? OR lower(title) = ?) AND status != 'failed'",
+            (name_lower, name_lower),
+        )
+        rows = _rows_to_dicts(cursor, await cursor.fetchall())
+        return rows[0] if rows else None
+
     async def create_document(self, kb_id: str, filename: str, title: str, dir_path: str, file_type: str, content: str, tags: list[str], date: str | None = None, metadata: dict | None = None) -> dict:
         db = self._db_or_raise()
         doc_id = str(uuid.uuid4())
@@ -226,10 +281,10 @@ class SqliteVaultFS(VaultFS):
         try:
             await db.execute(
                 "INSERT INTO documents (id, user_id, filename, title, path, relative_path, source_kind, "
-                "file_type, status, content, tags, date, metadata, version, document_number) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, 1, ?)",
+                "file_type, file_size, status, content, tags, date, metadata, version, document_number) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, 1, ?)",
                 (doc_id, self.user_id, filename, title, dir_path, relative_path, source_kind,
-                 file_type, content, json.dumps(tags), date,
+                 file_type, len(content.encode("utf-8")), content, json.dumps(tags), date,
                  json.dumps(metadata) if metadata else None, doc_number),
             )
             if file_type in ("md", "txt"):
@@ -245,8 +300,13 @@ class SqliteVaultFS(VaultFS):
 
     async def update_document(self, doc_id: str, content: str, tags: list[str] | None = None, title: str | None = None, date: str | None = None, metadata: dict | None = None) -> dict | None:
         db = self._db_or_raise()
-        sets = ["content = ?", "version = COALESCE(version, 0) + 1", "updated_at = datetime('now')"]
-        args: list = [content]
+        sets = [
+            "content = ?",
+            "file_size = ?",
+            "version = COALESCE(version, 0) + 1",
+            "updated_at = datetime('now')",
+        ]
+        args: list = [content, len(content.encode("utf-8"))]
 
         if title is not None:
             sets.append("title = ?")
@@ -281,6 +341,30 @@ class SqliteVaultFS(VaultFS):
             raise
         return {"id": doc_id, "filename": row[0], "path": row[1]} if row else None
 
+    async def add_highlight_reply(self, doc_id: str, highlight_id: str, reply: dict) -> dict | None:
+        db = self._db_or_raise()
+        cursor = await db.execute("SELECT highlights FROM documents WHERE id = ?", (doc_id,))
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        highlights = parse_highlights_value(row[0])
+        target = find_highlight(highlights, highlight_id)
+        if target is None:
+            return None
+        append_reply(target, reply)
+        try:
+            await db.execute(
+                "UPDATE documents SET highlights = ?, "
+                "version = COALESCE(version, 0) + 1, updated_at = datetime('now') "
+                "WHERE id = ?",
+                (json.dumps(highlights), doc_id),
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        return target
+
     async def archive_documents(self, doc_ids: list[str]) -> int:
         db = self._db_or_raise()
         if not doc_ids:
@@ -301,15 +385,43 @@ class SqliteVaultFS(VaultFS):
         )
         return _rows_to_dicts(cursor, await cursor.fetchall())
 
-    async def list_documents_with_content(self, kb_id: str) -> list[dict]:
+    async def list_documents_with_content(
+        self,
+        kb_id: str,
+        path_glob: str | None = None,
+        content_limit: int | None = None,
+        wiki_content_only: bool = False,
+    ) -> list[dict]:
         db = self._db_or_raise()
         cursor = await db.execute(
             "SELECT id, filename, title, path, content, tags, file_type, page_count, highlights, metadata, date "
             "FROM documents WHERE status != 'failed' "
             "AND COALESCE(json_extract(metadata, '$.asset'), 0) != 1 "
+            "AND (? IS NULL OR (path || filename) GLOB ?) "
             "ORDER BY path, filename",
+            (path_glob, path_glob),
         )
-        return _rows_to_dicts(cursor, await cursor.fetchall())
+        docs = _rows_to_dicts(cursor, await cursor.fetchall())
+        chars_left = content_limit
+        batch_text_types = {"md", "txt", "csv", "html", "svg", "json", "xml"}
+        for doc in docs:
+            allowed = (
+                (not wiki_content_only or doc["path"].startswith("/wiki/"))
+                and (content_limit is None or doc.get("file_type") in batch_text_types)
+            )
+            content = doc.get("content") or ""
+            if not allowed:
+                doc["content"] = None
+                doc["content_truncated"] = False
+                continue
+            if chars_left is None:
+                doc["content_truncated"] = False
+                continue
+            take = max(0, min(len(content), chars_left))
+            doc["content"] = content[:take] if take else None
+            doc["content_truncated"] = take < len(content)
+            chars_left -= take
+        return docs
 
 
     async def get_pages(self, doc_id: str, page_nums: list[int]) -> list[dict]:
@@ -328,6 +440,34 @@ class SqliteVaultFS(VaultFS):
         db = self._db_or_raise()
         cursor = await db.execute(
             "SELECT page, content FROM document_pages WHERE document_id = ? ORDER BY page",
+            (doc_id,),
+        )
+        return _rows_to_dicts(cursor, await cursor.fetchall())
+
+    async def get_pages_for_batch(self, doc_id: str, max_chars: int) -> list[dict]:
+        if max_chars <= 0:
+            return []
+        rows = await self.get_all_pages(doc_id)
+        result: list[dict] = []
+        chars_left = max_chars
+        for row in rows:
+            content = row.get("content") or ""
+            take = max(0, min(len(content), chars_left))
+            if take <= 0:
+                break
+            item = dict(row)
+            item["content"] = content[:take]
+            item["content_truncated"] = take < len(content)
+            result.append(item)
+            chars_left -= take + 32
+        return result
+
+    async def get_page_index(self, doc_id: str) -> list[dict]:
+        db = self._db_or_raise()
+        cursor = await db.execute(
+            "SELECT page, elements, "
+            "CASE WHEN content = '' THEN 0 ELSE length(content) - length(replace(content, char(10), '')) + 1 END AS row_count "
+            "FROM document_pages WHERE document_id = ? ORDER BY page",
             (doc_id,),
         )
         return _rows_to_dicts(cursor, await cursor.fetchall())
@@ -466,6 +606,30 @@ class SqliteVaultFS(VaultFS):
         except Exception as e:
             logger.warning("Failed to insert reference %s -> %s: %s", source_id[:8], target_id[:8], e)
 
+    async def replace_references(
+        self,
+        source_id: str,
+        kb_id: str,
+        edges: list[tuple[str, str, int | None]],
+    ) -> None:
+        db = self._db_or_raise()
+        try:
+            await db.execute(
+                "DELETE FROM document_references WHERE source_document_id = ?",
+                (source_id,),
+            )
+            if edges:
+                await db.executemany(
+                    "INSERT OR REPLACE INTO document_references "
+                    "(source_document_id, target_document_id, reference_type, page) "
+                    "VALUES (?, ?, ?, ?)",
+                    [(source_id, target_id, ref_type, page) for target_id, ref_type, page in edges],
+                )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+
     async def propagate_staleness(self, doc_id: str) -> None:
         db = self._db_or_raise()
         await db.execute(
@@ -499,6 +663,17 @@ class SqliteVaultFS(VaultFS):
             "WHERE dr.source_document_id = ? AND d.status != 'failed' "
             "ORDER BY dr.reference_type, d.path, d.filename",
             (doc_id,),
+        )
+        return _rows_to_dicts(cursor, await cursor.fetchall())
+
+    async def get_reference_edges(self, kb_id: str) -> list[dict]:
+        db = self._db_or_raise()
+        cursor = await db.execute(
+            "SELECT dr.source_document_id AS source_id, dr.target_document_id AS target_id, "
+            "       dr.reference_type, dr.page "
+            "FROM document_references dr "
+            "JOIN documents source ON source.id = dr.source_document_id "
+            "WHERE source.status != 'failed'"
         )
         return _rows_to_dicts(cursor, await cursor.fetchall())
 
@@ -546,7 +721,6 @@ class SqliteVaultFS(VaultFS):
     async def _scaffold_wiki(self, kb_id: str, name: str) -> None:
         today = date.today().isoformat()
         overview = _OVERVIEW_TEMPLATE.format(name=name, date=today)
-        log = _LOG_TEMPLATE.format(name=name, date=today)
         # Never overwrite existing local content — a rebuilt index could scaffold over real files.
         if not self._disk_file_exists("/wiki/", "overview.md"):
             await self.create_document(
@@ -555,8 +729,3 @@ class SqliteVaultFS(VaultFS):
                 metadata={"description": f"Research hub for {name}."},
             )
             self.write_to_disk("/wiki/", "overview.md", overview)
-        if not self._disk_file_exists("/wiki/", "log.md"):
-            await self.create_document(
-                kb_id, "log.md", "Log", "/wiki/", "md", log, ["log"],
-            )
-            self.write_to_disk("/wiki/", "log.md", log)

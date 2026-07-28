@@ -197,6 +197,7 @@ async def client_no_rls(pool):
             await _pool.release(conn)
 
     app.state.pool = pool
+    app.state.mode = "hosted"
     app.state.s3_service = None
     app.state.ocr_service = None
     app.state.auth_provider = None

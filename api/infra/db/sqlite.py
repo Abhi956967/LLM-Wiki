@@ -14,6 +14,8 @@ from pathlib import Path
 
 import aiosqlite
 
+from services.highlight_merge import preserve_replies
+
 logger = logging.getLogger(__name__)
 
 _SCHEMA_PATH = Path(__file__).parent.parent.parent.parent / "shared" / "sqlite_schema.sql"
@@ -93,12 +95,54 @@ async def create_pool(db_path: str, init_schema: bool = True) -> aiosqlite.Conne
     await db.execute("PRAGMA foreign_keys=ON")
     await db.execute("PRAGMA busy_timeout=5000")
     if init_schema:
+        events_table = await db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'knowledge_base_events'",
+        )
+        had_events_table = await events_table.fetchone() is not None
         schema = _SCHEMA_PATH.read_text(encoding='utf-8')
         await db.executescript(schema)
         # No migration runner: add workspace.kind to pre-existing DBs.
         cur = await db.execute("PRAGMA table_info(workspace)")
         if "kind" not in {row[1] for row in await cur.fetchall()}:
             await db.execute("ALTER TABLE workspace ADD COLUMN kind TEXT NOT NULL DEFAULT 'wiki'")
+
+        # Honest, idempotent activity backfill for pre-existing workspaces.
+        # We know creation times, but updated_at also reflects processing and
+        # highlight writes, so it must never be treated as historical edits.
+        await db.execute(
+            "INSERT OR IGNORE INTO knowledge_base_events "
+            "(knowledge_base_id, user_id, event_type, subject_kind, subject_title, "
+            " event_key, occurred_at) "
+            "SELECT id, user_id, 'wiki.created', 'wiki', name, "
+            "       'kb:' || id || ':created', created_at FROM workspace",
+        )
+        await db.execute(
+            "INSERT OR IGNORE INTO knowledge_base_events "
+            "(knowledge_base_id, user_id, event_type, subject_kind, document_id, "
+            " document_number, document_version, subject_title, subject_path, "
+            " event_key, metadata, occurred_at) "
+            "SELECT (SELECT id FROM workspace LIMIT 1), d.user_id, "
+            "       CASE WHEN d.source_kind = 'wiki' THEN 'page.created' ELSE 'source.added' END, "
+            "       CASE WHEN d.source_kind = 'wiki' THEN 'wiki_page' ELSE 'source' END, "
+            "       d.id, d.document_number, d.version, "
+            "       COALESCE(NULLIF(d.title, ''), d.filename), d.path || d.filename, "
+            "       'doc:' || d.id || ':created', "
+            "       json_object('file_type', d.file_type, 'file_size', d.file_size), d.created_at "
+            "FROM documents d "
+            "WHERE d.source_kind <> 'asset' "
+            "  AND COALESCE(json_extract(d.metadata, '$.hidden'), 0) = 0 "
+            "  AND COALESCE(json_extract(d.metadata, '$.asset'), 0) = 0 "
+            "  AND NOT (d.path = '/wiki/' AND d.filename IN ('index.json', 'log.md', 'overview.md')) "
+            "ORDER BY d.created_at, d.id",
+        )
+        if not had_events_table:
+            await db.execute(
+                "INSERT OR IGNORE INTO knowledge_base_events "
+                "(knowledge_base_id, user_id, event_type, subject_kind, subject_title, "
+                " event_key) "
+                "SELECT id, user_id, 'tracking.started', 'wiki', name, "
+                "       'kb:' || id || ':tracking-started' FROM workspace",
+            )
         await db.commit()
     return db
 
@@ -173,10 +217,10 @@ class SQLiteDocumentRepository:
 
         await self._db.execute(
             "INSERT INTO documents (id, user_id, filename, title, path, relative_path, source_kind, "
-            "file_type, status, content, tags, version, document_number) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, 'md', 'ready', ?, ?, 0, ?)",
+            "file_type, file_size, status, content, tags, version, document_number) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'md', ?, 'ready', ?, ?, 0, ?)",
             (doc_id, user_id, filename, title, path, relative_path, source_kind,
-             content, json.dumps(tags), doc_number),
+             len(content.encode("utf-8")), content, json.dumps(tags), doc_number),
         )
         await self._db.commit()
         return await self.get(doc_id)
@@ -184,10 +228,10 @@ class SQLiteDocumentRepository:
     @_serialized
     async def update_content(self, doc_id: str, user_id: str, content: str) -> dict | None:
         cursor = await self._db.execute(
-            "UPDATE documents SET content = ?, version = version + 1, "
+            "UPDATE documents SET content = ?, file_size = ?, version = version + 1, "
             "updated_at = datetime('now') WHERE id = ? "
             "RETURNING id, content, version",
-            (content, doc_id),
+            (content, len(content.encode("utf-8")), doc_id),
         )
         row = await cursor.fetchone()
         await self._db.commit()
@@ -296,6 +340,7 @@ class SQLiteDocumentRepository:
                 await self._db.rollback()
                 return {"conflict": True}
             old_highlights = self._parse_highlights(existing[1])
+            preserve_replies(highlights, old_highlights)
 
             payload = json.dumps(highlights)
             cursor = await self._db.execute(
@@ -347,6 +392,7 @@ class SQLiteDocumentRepository:
                 return {"conflict": True}
 
             current = self._parse_highlights(highlights_raw)
+            preserve_replies([highlight], current)
             replaced = False
             next_list: list[dict] = []
             for h in current:

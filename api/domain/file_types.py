@@ -15,3 +15,8 @@ SIMPLE_TEXT_TYPES = frozenset({
 # Need an extraction/processing backend before they're searchable. HTML is here
 # (not in SIMPLE_TEXT_TYPES) because it goes through the webmd parser.
 EXTRACTION_TYPES = PDF_TYPES | OFFICE_TYPES | SPREADSHEET_TYPES | HTML_TYPES
+
+# Files routed through the local background processor. Images do not need text
+# extraction, but the processor still finalizes their metadata/status, so they
+# must participate in upload dispatch and interrupted-work reconciliation.
+PROCESSING_TYPES = EXTRACTION_TYPES | IMAGE_TYPES

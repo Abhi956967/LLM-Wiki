@@ -1,6 +1,6 @@
-import json
-import base64
 import asyncio
+import base64
+import json
 import logging
 import subprocess
 import tempfile
@@ -8,28 +8,50 @@ from pathlib import Path
 
 import asyncpg
 import httpx
-
 from config import settings
-from services.s3 import S3Service
-from services.chunker import chunk_text, chunk_pages, store_chunks
+from services.bulk_persistence import insert_assets, insert_pages
+from services.chunker import chunk_pages, chunk_text, store_chunks
 from services.extracted_assets import ExtractedAsset, build_pdf_image_assets
-from services.pdf_extract import extract_pdf
+from services.s3 import S3Service
 
 logger = logging.getLogger(__name__)
 
 MISTRAL_OCR_URL = "https://api.mistral.ai/v1/ocr"
 MAX_RETRIES = 3
 RETRY_BACKOFF = [2, 5, 10]
+MAX_CONCURRENT_CONVERTER_REQUESTS = 2
+CONVERTER_RETRY_BACKOFF = [1, 2]
 
 OFFICE_TYPES = {"pptx", "ppt", "docx", "doc"}
 IMAGE_TYPES = {"png", "jpg", "jpeg", "webp", "gif"}
 OCR_TYPES = {"pdf"} | OFFICE_TYPES | IMAGE_TYPES
+
+
+def _extract_pdf_in_process(pdf_path: str):
+    """Lazy local-only import; hosted mode must never load the PDF parser."""
+    from services.pdf_extract import extract_pdf
+
+    return extract_pdf(pdf_path)
+
+
+def _converter_retry_delay(retry_after: str | None, default: float) -> float:
+    if not retry_after:
+        return default
+    try:
+        return max(0.0, min(float(retry_after), 30.0))
+    except ValueError:
+        return default
+
 
 class OCRService:
     def __init__(self, s3: S3Service, pool: asyncpg.Pool):
         self._s3 = s3
         self._pool = pool
         self._semaphore = asyncio.Semaphore(3)
+        # Match the converter's default extraction capacity. This prevents one
+        # API worker from predictably overloading a single converter instance;
+        # retries below still cover capacity shared by multiple API workers.
+        self._converter_semaphore = asyncio.Semaphore(MAX_CONCURRENT_CONVERTER_REQUESTS)
 
     async def process_document(self, document_id: str, user_id: str):
         async with self._semaphore:
@@ -131,10 +153,14 @@ class OCRService:
             pages = await self._call_converter_extract(presigned_url, "pdf")
             await self._store_extracted_pages(document_id, user_id, kb_id, pages, "opendataloader")
         else:
+            if settings.MODE != "local":
+                raise RuntimeError(
+                    "Hosted PDF parsing requires the isolated converter service"
+                )
             await self._process_opendataloader(document_id, user_id, kb_id, s3_source_key)
 
     async def _process_office(self, document_id: str, user_id: str, kb_id: str, s3_source_key: str, ext: str):
-        """Process Office files. Routes through converter or falls back to local LibreOffice."""
+        """Process Office files through the converter, with local-only fallback."""
         if settings.PDF_BACKEND == "mistral":
             pdf_key = await self._convert_to_pdf_s3(document_id, user_id, s3_source_key, ext)
             if not settings.MISTRAL_API_KEY:
@@ -148,6 +174,10 @@ class OCRService:
             pages = await self._call_converter_extract(presigned_url, ext)
             await self._store_extracted_pages(document_id, user_id, kb_id, pages, "opendataloader")
         else:
+            if settings.MODE != "local":
+                raise RuntimeError(
+                    "Hosted Office parsing requires the isolated converter service"
+                )
             await self._process_office_local(document_id, user_id, kb_id, s3_source_key, ext)
 
     # ── Converter integration (hosted mode) ───────────────────────────────
@@ -166,12 +196,33 @@ class OCRService:
         if settings.CONVERTER_SECRET:
             headers["Authorization"] = f"Bearer {settings.CONVERTER_SECRET}"
 
-        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
-            resp = await client.post(
-                f"{settings.CONVERTER_URL}/extract",
-                json={"source_url": source_url, "source_ext": ext, "request_id": request_id},
-                headers=headers,
-            )
+        payload = {"source_url": source_url, "source_ext": ext, "request_id": request_id}
+        async with (
+            self._converter_semaphore,
+            httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client,
+        ):
+            for attempt in range(MAX_RETRIES):
+                resp = await client.post(
+                    f"{settings.CONVERTER_URL}/extract",
+                    json=payload,
+                    headers=headers,
+                )
+                if resp.status_code != 503 or attempt == MAX_RETRIES - 1:
+                    break
+
+                delay = CONVERTER_RETRY_BACKOFF[
+                    min(attempt, len(CONVERTER_RETRY_BACKOFF) - 1)
+                ]
+                delay = _converter_retry_delay(resp.headers.get("retry-after"), delay)
+                logger.warning(
+                    "Converter at capacity; retrying request_id=%s attempt=%d/%d in %.1fs",
+                    request_id,
+                    attempt + 2,
+                    MAX_RETRIES,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+
             resp.raise_for_status()
             data = resp.json()
 
@@ -194,11 +245,14 @@ class OCRService:
     # ── OpenDataLoader local extraction ───────────────────────────────────
 
     async def _process_opendataloader(self, document_id: str, user_id: str, kb_id: str, s3_source_key: str):
-        """Extract PDF via opendataloader-pdf (local mode or hosted fallback)."""
+        """Extract PDF via opendataloader-pdf in local mode only."""
         with tempfile.TemporaryDirectory() as tmpdir:
             pdf_path = Path(tmpdir) / "source.pdf"
             await self._s3.download_to_file(s3_source_key, str(pdf_path))
-            pages_with_images = await asyncio.to_thread(extract_pdf, str(pdf_path))
+            pages_with_images = await asyncio.to_thread(
+                _extract_pdf_in_process,
+                str(pdf_path),
+            )
 
         assets, page_elements = await self._build_pdf_assets(document_id, pages_with_images)
 
@@ -241,6 +295,10 @@ class OCRService:
                         f"Converter response binding mismatch: sent {request_id}, got {echoed_id}"
                     )
         else:
+            if settings.MODE != "local":
+                raise RuntimeError(
+                    "Hosted Office conversion requires the isolated converter service"
+                )
             with tempfile.TemporaryDirectory() as tmpdir:
                 source_path = Path(tmpdir) / f"source.{ext}"
                 await self._s3.download_to_file(s3_source_key, str(source_path))
@@ -276,7 +334,10 @@ class OCRService:
             if not pdf_path.exists():
                 raise RuntimeError("LibreOffice did not produce a PDF")
 
-            pages_with_images = await asyncio.to_thread(extract_pdf, str(pdf_path))
+            pages_with_images = await asyncio.to_thread(
+                _extract_pdf_in_process,
+                str(pdf_path),
+            )
 
         assets, page_elements = await self._build_pdf_assets(document_id, pages_with_images)
 
@@ -315,6 +376,9 @@ class OCRService:
                 asset.content_type,
             )
 
+    _insert_pages = staticmethod(insert_pages)
+    _insert_assets = staticmethod(insert_assets)
+
     async def _store_extracted_pages(
         self, document_id: str, user_id: str, kb_id: str,
         page_contents: list[tuple[int, str]], parser: str,
@@ -346,30 +410,12 @@ class OCRService:
                     "AND metadata->>'kind' = 'pdf_image'",
                     user_id, document_id,
                 )
-                for num, md in page_contents:
-                    elements = (page_elements or {}).get(num)
-                    await conn.execute(
-                        "INSERT INTO document_pages (document_id, page, content, elements) "
-                        "VALUES ($1, $2, $3, $4)",
-                        document_id, num, md,
-                        json.dumps(elements) if elements else None,
-                    )
-                for asset in assets or []:
-                    await conn.execute(
-                        "INSERT INTO documents (id, knowledge_base_id, user_id, filename, path, title, "
-                        "file_type, file_size, status, content, tags, metadata) "
-                        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'ready', NULL, $9, $10::jsonb)",
-                        asset.document_id,
-                        kb_id,
-                        user_id,
-                        asset.filename,
-                        asset.path,
-                        asset.filename,
-                        asset.file_type,
-                        len(asset.data),
-                        [],
-                        json.dumps(asset.metadata()),
-                    )
+                await self._insert_pages(
+                    conn,
+                    document_id,
+                    [(num, md, (page_elements or {}).get(num)) for num, md in page_contents],
+                )
+                await self._insert_assets(conn, kb_id, user_id, assets or [])
                 metadata_patch = (
                     json.dumps({"assets": [asset.metadata() for asset in assets]})
                     if assets else None
@@ -463,13 +509,14 @@ class OCRService:
                 async with conn.transaction():
                     await self._check_user_page_limit(user_id, len(sheets), conn=conn)
                     await conn.execute("DELETE FROM document_pages WHERE document_id = $1", document_id)
-                    for i, (name, md) in enumerate(sheets, 1):
-                        await conn.execute(
-                            "INSERT INTO document_pages (document_id, page, content, elements) "
-                            "VALUES ($1, $2, $3, $4)",
-                            document_id, i, md,
-                            json.dumps({"sheet_name": name}),
-                        )
+                    await self._insert_pages(
+                        conn,
+                        document_id,
+                        [
+                            (i, md, {"sheet_name": name})
+                            for i, (name, md) in enumerate(sheets, 1)
+                        ],
+                    )
                     await conn.execute(
                         "UPDATE documents SET status = 'ready', content = $2, page_count = $3, parser = 'openpyxl', updated_at = now() "
                         "WHERE id = $1",
@@ -562,6 +609,7 @@ class OCRService:
             async with conn.transaction():
                 await self._check_user_page_limit(user_id, page_count, conn=conn)
                 await conn.execute("DELETE FROM document_pages WHERE document_id = $1", document_id)
+                page_rows: list[tuple[int, str, dict | None]] = []
                 for page in pages:
                     page_index = page.get("index", 0) + 1
                     page_md = page.get("markdown", "")
@@ -573,34 +621,15 @@ class OCRService:
                         elements["dimensions"] = page["dimensions"]
                     if page.get("tables"):
                         elements["tables"] = page["tables"]
-                    await conn.execute(
-                        "INSERT INTO document_pages (document_id, page, content, elements) "
-                        "VALUES ($1, $2, $3, $4)",
-                        document_id, page_index, page_md,
-                        json.dumps(elements) if elements else None,
-                    )
+                    page_rows.append((page_index, page_md, elements or None))
+                await self._insert_pages(conn, document_id, page_rows)
                 await conn.execute(
                     "DELETE FROM documents WHERE user_id = $1 "
                     "AND metadata->>'parent_document_id' = $2 "
                     "AND metadata->>'kind' = 'pdf_image'",
                     user_id, document_id,
                 )
-                for asset in assets:
-                    await conn.execute(
-                        "INSERT INTO documents (id, knowledge_base_id, user_id, filename, path, title, "
-                        "file_type, file_size, status, content, tags, metadata) "
-                        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'ready', NULL, $9, $10::jsonb)",
-                        asset.document_id,
-                        kb_id,
-                        user_id,
-                        asset.filename,
-                        asset.path,
-                        asset.filename,
-                        asset.file_type,
-                        len(asset.data),
-                        [],
-                        json.dumps(asset.metadata()),
-                    )
+                await self._insert_assets(conn, kb_id, user_id, assets)
                 metadata_patch = (
                     json.dumps({"assets": [asset.metadata() for asset in assets]})
                     if assets else None

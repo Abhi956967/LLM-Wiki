@@ -1,7 +1,11 @@
 """Unit tests for the PDF extraction module (opendataloader-pdf integration)."""
 
-from services.pdf_extract import _element_to_markdown, _elements_to_pages, extract_pdf
+import subprocess
+
+import pytest
+import services.pdf_extract as pdf_extract
 from services.extracted_assets import build_pdf_image_assets
+from services.pdf_extract import _element_to_markdown, _elements_to_pages, extract_pdf
 
 
 class TestElementToMarkdown:
@@ -168,3 +172,62 @@ def test_build_pdf_image_assets_uses_hidden_relative_asset_paths():
     assert assets[0].metadata()["hidden"] is True
     assert assets[0].metadata()["kind"] == "pdf_image"
     assert page_elements[1]["images"][0]["src"] == "./quarterly-report.assets/page-001-image-01.png"
+
+
+def test_extractor_timeout_kills_process_group(monkeypatch, tmp_path):
+    killed: list[tuple[int, int]] = []
+
+    class StalledProcess:
+        pid = 4312
+        returncode = None
+
+        def communicate(self, timeout):
+            raise subprocess.TimeoutExpired("extract", timeout)
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self):
+            self.returncode = -9
+            return self.returncode
+
+    process = StalledProcess()
+    monkeypatch.setattr(pdf_extract.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(pdf_extract.os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(
+        pdf_extract.os,
+        "killpg",
+        lambda process_group, sig: killed.append((process_group, sig)),
+    )
+    monkeypatch.setattr(pdf_extract, "EXTRACT_TIMEOUT_SECONDS", 0.01)
+
+    with pytest.raises(TimeoutError, match="timed out"):
+        pdf_extract._run_extractor(str(tmp_path / "source.pdf"), str(tmp_path))
+
+    assert killed == [(process.pid, pdf_extract.signal.SIGKILL)]
+    assert process.returncode == -9
+
+
+def test_extract_pdf_rejects_oversized_json_before_loading(monkeypatch, tmp_path):
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"%PDF-1.4")
+
+    def write_large_output(_source: str, output_dir: str) -> None:
+        (pdf_extract.Path(output_dir) / "result.json").write_bytes(b"x" * 32)
+
+    monkeypatch.setattr(pdf_extract, "_run_extractor", write_large_output)
+    monkeypatch.setattr(pdf_extract, "MAX_EXTRACT_JSON_BYTES", 16)
+
+    with pytest.raises(RuntimeError, match="output exceeds"):
+        extract_pdf(str(source))
+
+
+def test_elements_to_pages_rejects_unbounded_element_count(monkeypatch):
+    monkeypatch.setattr(pdf_extract, "MAX_EXTRACT_ELEMENTS", 2)
+    elements = [
+        {"type": "paragraph", "page number": 1, "content": str(index)}
+        for index in range(3)
+    ]
+
+    with pytest.raises(RuntimeError, match="too many elements"):
+        _elements_to_pages(elements, total_pages=1)

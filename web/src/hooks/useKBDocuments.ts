@@ -135,7 +135,7 @@ export function useKBDocuments(knowledgeBaseId: string) {
         // and let the accessToken dependency recreate the socket.
         if (e.code === WS_CLOSE_AUTH) {
           console.warn('WebSocket auth failed; refreshing token:', e.reason)
-          refreshAccessToken().catch((err) => {
+          refreshAccessToken(accessToken!).catch((err) => {
             console.error('Token refresh after WebSocket auth failure failed:', err)
           })
           return

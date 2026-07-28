@@ -27,6 +27,14 @@ import {
   setSelectedKnowledgeBaseId,
   type Mode,
 } from "@/lib/settings";
+import { runtimeMessageWithDeadline, withDeadline } from "@/lib/deadline";
+import { capturePageHtml } from "@/lib/page-capture";
+import {
+  ensureContentStarted,
+  type ContentStartupState,
+} from "@/lib/content-startup";
+
+type ContentGlobalState = ContentStartupState<HighlightController>;
 
 export default defineContentScript({
   // Injected on demand via chrome.scripting.executeScript when the popup opens
@@ -37,13 +45,22 @@ export default defineContentScript({
   runAt: "document_idle",
   cssInjectionMode: "manual",
   async main() {
-    const w = window as unknown as { __llmwikiLoaded?: boolean };
-    if (w.__llmwikiLoaded) return;
-    w.__llmwikiLoaded = true;
-    if (isRestrictedPage()) return;
-    if (isLlmWikiAppPage()) return;
-    if (await isDomainDisabled(location.hostname)) return;
-    new HighlightController();
+    const state = window as unknown as ContentGlobalState;
+    try {
+      await ensureContentStarted(state, {
+        isEligible: async () => {
+          if (isRestrictedPage() || isLlmWikiAppPage()) return false;
+          return !(await isDomainDisabled(location.hostname));
+        },
+        createController: () => new HighlightController(),
+        bootstrap: (controller) => controller.initialize(),
+        dispose: (controller) => controller.dispose(),
+      });
+    } catch (error) {
+      // The shared in-flight sentinel is already cleared. A later popup
+      // injection can retry after transient storage/background failures.
+      console.warn("[llmwiki] content startup failed:", error);
+    }
   },
 });
 
@@ -55,21 +72,8 @@ function isLlmWikiAppPage(): boolean {
 }
 
 const STYLE_ID = "llmwiki-highlight-style";
-const MAX_CAPTURED_IMAGES = 24;
 const PENDING_PAGE_PREFIX = "llmwiki_pending_page:";
-const LAZY_IMAGE_SRC_ATTRIBUTES = [
-  "data-src",
-  "data-original",
-  "data-lazy-src",
-  "data-hires",
-  "data-url",
-  "data-image",
-  "data-full-url",
-];
-const LAZY_IMAGE_SRCSET_ATTRIBUTES = [
-  "data-srcset",
-  "data-lazy-srcset",
-];
+const CONTENT_STORAGE_TIMEOUT_MS = 5_000;
 
 interface SessionResponse {
   accessToken: string | null;
@@ -285,79 +289,6 @@ function canonicalizeUrl(href: string): string {
   }
 }
 
-function largestSrcsetUrl(srcset: string): string {
-  let bestUrl = "";
-  let bestWidth = 0;
-  for (const raw of srcset.split(",")) {
-    const parts = raw.trim().split(/\s+/);
-    if (!parts[0]) continue;
-    const width = parts[1]?.endsWith("w")
-      ? Number.parseInt(parts[1], 10)
-      : 0;
-    if (!bestUrl || width > bestWidth) {
-      bestUrl = parts[0];
-      bestWidth = width;
-    }
-  }
-  try {
-    return bestUrl ? new URL(bestUrl, location.href).toString() : "";
-  } catch {
-    return bestUrl;
-  }
-}
-
-function absoluteImageUrl(value: string | null | undefined): string {
-  if (!value) return "";
-  const trimmed = value.trim();
-  if (!trimmed) return "";
-  try {
-    return new URL(trimmed, location.href).toString();
-  } catch {
-    return trimmed;
-  }
-}
-
-function pictureSourceUrl(img: HTMLImageElement): string {
-  const picture = img.closest("picture");
-  if (!picture) return "";
-  for (const source of Array.from(picture.querySelectorAll("source"))) {
-    const srcset = source.getAttribute("srcset") || source.getAttribute("data-srcset") || "";
-    const best = largestSrcsetUrl(srcset);
-    if (best) return best;
-    const src = absoluteImageUrl(source.getAttribute("src"));
-    if (src) return src;
-  }
-  return "";
-}
-
-function candidateImageUrl(img: HTMLImageElement): string {
-  const directCandidates = [
-    img.currentSrc,
-    img.getAttribute("src"),
-    img.src,
-    largestSrcsetUrl(img.getAttribute("srcset") || ""),
-    pictureSourceUrl(img),
-    ...LAZY_IMAGE_SRC_ATTRIBUTES.map((attr) => img.getAttribute(attr)),
-    ...LAZY_IMAGE_SRCSET_ATTRIBUTES.map((attr) => largestSrcsetUrl(img.getAttribute(attr) || "")),
-  ];
-
-  for (const candidate of directCandidates) {
-    const src = absoluteImageUrl(candidate);
-    if (src) return src;
-  }
-  return "";
-}
-
-function imageDimensions(img: HTMLImageElement): { width: number; height: number } {
-  const rect = img.getBoundingClientRect();
-  const widthAttr = Number.parseInt(img.getAttribute("width") || "", 10);
-  const heightAttr = Number.parseInt(img.getAttribute("height") || "", 10);
-  return {
-    width: Math.round(rect.width || img.naturalWidth || widthAttr || 0),
-    height: Math.round(rect.height || img.naturalHeight || heightAttr || 0),
-  };
-}
-
 class HighlightController {
   private highlights: Highlight[] = [];
   private deletedHighlightIds = new Set<string>();
@@ -376,16 +307,62 @@ class HighlightController {
   private restoredPendingState = false;
   private autoSavePromise: Promise<boolean> | null = null;
   private autoSaveIncludedHighlightIds = new Set<string>();
+  private disposed = false;
+  private listenersAttached = false;
 
-  constructor() {
+  async initialize(): Promise<void> {
+    await this.bootstrap();
+    this.assertActive();
     injectStyle();
-    this.bootstrap();
+    this.attachListeners();
+  }
+
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    if (this.saveTimer) window.clearTimeout(this.saveTimer);
+    if (this.toastTimer) window.clearTimeout(this.toastTimer);
+    this.saveTimer = null;
+    this.toastTimer = null;
+    this.removePill();
+    this.removePopover();
+    document.querySelector(".llmwiki-toast")?.remove();
+
+    this.detachListeners();
+    document.getElementById(STYLE_ID)?.remove();
+  }
+
+  private attachListeners(): void {
+    if (this.listenersAttached) return;
+    // Set first so dispose() removes any partial registration if a later
+    // Chrome API call throws during extension invalidation.
+    this.listenersAttached = true;
     document.addEventListener("mouseup", this.onMouseUp);
     document.addEventListener("mousedown", this.onMouseDown);
     document.addEventListener("click", this.onMarkClick, true);
     document.addEventListener("scroll", this.onViewportChange, true);
     window.addEventListener("resize", this.onViewportChange);
     chrome.runtime.onMessage.addListener(this.onRuntimeMessage);
+  }
+
+  private detachListeners(): void {
+    if (!this.listenersAttached) return;
+    document.removeEventListener("mouseup", this.onMouseUp);
+    document.removeEventListener("mousedown", this.onMouseDown);
+    document.removeEventListener("click", this.onMarkClick, true);
+    document.removeEventListener("scroll", this.onViewportChange, true);
+    window.removeEventListener("resize", this.onViewportChange);
+    try {
+      chrome.runtime.onMessage.removeListener(this.onRuntimeMessage);
+    } catch {
+      // Extension context invalidation can make Chrome APIs unavailable; DOM
+      // listeners are still removed so a later retry cannot duplicate them.
+    }
+    this.listenersAttached = false;
+  }
+
+  private assertActive(): void {
+    if (this.disposed) throw new Error("Content controller was disposed during startup");
   }
 
   private async ensureSession(): Promise<string | null> {
@@ -395,53 +372,72 @@ class HighlightController {
       this.accessToken = null;
       return null;
     }
-    const session: SessionResponse | undefined = await chrome.runtime.sendMessage({ type: "GET_SESSION" });
+    const session = await runtimeMessageWithDeadline<SessionResponse | undefined>(
+      { type: "GET_SESSION" },
+      5_000,
+      "Timed out while checking the extension session",
+    );
     this.accessToken = session?.accessToken ?? null;
     return this.accessToken;
   }
 
-  private async bootstrap() {
+  private async bootstrap(): Promise<void> {
+    const [mode, apiUrl, knowledgeBaseId, folderPath] = await withDeadline(
+      Promise.all([
+        getMode(),
+        getApiUrl(),
+        getSelectedKnowledgeBaseId(),
+        getSelectedFolderPath(),
+      ]),
+      CONTENT_STORAGE_TIMEOUT_MS,
+      "Content settings storage timed out",
+    );
+    this.assertActive();
+    this.mode = mode;
+    this.apiUrl = apiUrl;
+    this.knowledgeBaseId = knowledgeBaseId;
+    this.folderPath = folderPath;
+
+    await this.ensureSession();
+    this.assertActive();
+    // In cloud mode, no token means the user is signed out. Keep the page
+    // untouched until they sign in. Local mode is intentionally unauthenticated.
+    if (this.mode !== "local" && !this.accessToken) return;
+
+    await this.restorePendingPageState();
+    this.assertActive();
+    const url = canonicalizeUrl(location.href);
+    let doc;
     try {
-      this.mode = await getMode();
-      this.apiUrl = await getApiUrl();
-      this.knowledgeBaseId = await getSelectedKnowledgeBaseId();
-      this.folderPath = await getSelectedFolderPath();
-      await this.ensureSession();
-      // In cloud mode, no token means the user is signed out. Keep the page
-      // untouched until they sign in. Local mode is intentionally unauthenticated.
-      if (this.mode !== "local" && !this.accessToken) return;
-      await this.restorePendingPageState();
-      const url = canonicalizeUrl(location.href);
-      let doc;
-      try {
-        doc = await getDocumentByUrl(this.apiUrl, this.accessToken, url);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        // 401 means the stored session is stale; sign-in flow will refresh.
-        // Network failures are expected when a selected local server is down.
-        // Pending edits are already restored from chrome.storage and will
-        // retry on the next sync opportunity, so do not spam extension logs.
-        if (shouldWarnForLookupFailure(msg)) {
-          console.warn("[llmwiki] by-url lookup failed:", err);
-        }
-        if (this.highlights.length || this.deletedHighlightIds.size) this.scheduleSave();
-        return;
-      }
-      if (!doc) {
-        if (this.highlights.length || this.deletedHighlightIds.size) this.scheduleSave();
-        return;
-      }
-      this.documentId = doc.id;
-      this.knowledgeBaseId = doc.knowledge_base_id;
-      this.version = doc.version;
-      this.highlights = mergeHighlightsById(doc.highlights ?? [], this.highlights);
-      this.dropDeletedHighlights();
-      // Defer apply slightly so SPA hydration settles
-      window.requestAnimationFrame(() => applyHighlights(this.highlights));
-      if (this.highlights.length || this.deletedHighlightIds.size) this.scheduleSave();
+      doc = await getDocumentByUrl(this.apiUrl, this.accessToken, url);
+      this.assertActive();
     } catch (err) {
-      console.warn("[llmwiki] bootstrap failed:", err);
+      this.assertActive();
+      const msg = err instanceof Error ? err.message : String(err);
+      // 401 means the stored session is stale; sign-in flow will refresh.
+      // Network failures are expected when a selected local server is down.
+      // Pending edits are already restored from chrome.storage and will
+      // retry on the next sync opportunity, so do not spam extension logs.
+      if (shouldWarnForLookupFailure(msg)) {
+        console.warn("[llmwiki] by-url lookup failed:", err);
+      }
+      if (this.highlights.length || this.deletedHighlightIds.size) this.scheduleSave();
+      return;
     }
+    if (!doc) {
+      if (this.highlights.length || this.deletedHighlightIds.size) this.scheduleSave();
+      return;
+    }
+    this.documentId = doc.id;
+    this.knowledgeBaseId = doc.knowledge_base_id;
+    this.version = doc.version;
+    this.highlights = mergeHighlightsById(doc.highlights ?? [], this.highlights);
+    this.dropDeletedHighlights();
+    // Defer apply slightly so SPA hydration settles.
+    window.requestAnimationFrame(() => {
+      if (!this.disposed) applyHighlights(this.highlights);
+    });
+    if (this.highlights.length || this.deletedHighlightIds.size) this.scheduleSave();
   }
 
   private async refreshAfterSave(documentId: string, flushPending = true) {
@@ -467,10 +463,16 @@ class HighlightController {
     if (sender.id !== chrome.runtime.id) return false;
     if (msg.type === "GET_PAGE_HIGHLIGHTS") {
       sendResponse({ highlights: this.highlights });
-      return true;
+      return false;
     }
     if (msg.type === "DOCUMENT_SAVED" && msg.documentId) {
-      this.refreshAfterSave(msg.documentId).then(() => sendResponse({ ok: true }));
+      void this.refreshAfterSave(msg.documentId).then(
+        () => sendResponse({ ok: true }),
+        (error: unknown) => sendResponse({
+          ok: false,
+          error: error instanceof Error ? error.message : "Could not refresh saved document",
+        }),
+      );
       return true;
     }
     return undefined;
@@ -515,6 +517,8 @@ class HighlightController {
     if (this.mode !== "local" && !this.accessToken) {
       void this.ensureSession().then((token) => {
         if (token) this.maybeShowPill();
+      }).catch(() => {
+        this.showToast("Could not reach the extension. Try again.");
       });
       return;
     }
@@ -768,26 +772,29 @@ class HighlightController {
   }
 
   private async restorePendingPageState() {
-    try {
-      const key = this.pendingStorageKey();
-      const result = await chrome.storage.local.get(key);
-      const pending = result[key] as PendingPageState | undefined;
-      if (!pending || pending.url !== canonicalizeUrl(location.href)) return;
+    const key = this.pendingStorageKey();
+    const result = await withDeadline(
+      chrome.storage.local.get(key),
+      CONTENT_STORAGE_TIMEOUT_MS,
+      "Pending highlight storage timed out",
+    );
+    this.assertActive();
+    const pending = result[key] as PendingPageState | undefined;
+    if (!pending || pending.url !== canonicalizeUrl(location.href)) return;
 
-      this.documentId = this.documentId ?? pending.documentId ?? null;
-      this.knowledgeBaseId = this.knowledgeBaseId ?? pending.knowledgeBaseId ?? null;
-      this.version = this.version ?? pending.version ?? null;
-      this.folderPath = pending.folderPath || this.folderPath;
-      this.highlights = mergeHighlightsById(this.highlights, pending.highlights ?? []);
-      this.deletedHighlightIds = new Set(pending.deletedHighlightIds ?? []);
-      this.dropDeletedHighlights();
-      this.restoredPendingState = true;
+    this.documentId = this.documentId ?? pending.documentId ?? null;
+    this.knowledgeBaseId = this.knowledgeBaseId ?? pending.knowledgeBaseId ?? null;
+    this.version = this.version ?? pending.version ?? null;
+    this.folderPath = pending.folderPath || this.folderPath;
+    this.highlights = mergeHighlightsById(this.highlights, pending.highlights ?? []);
+    this.deletedHighlightIds = new Set(pending.deletedHighlightIds ?? []);
+    this.dropDeletedHighlights();
+    this.restoredPendingState = true;
 
-      if (this.highlights.length) {
-        window.requestAnimationFrame(() => applyHighlights(this.highlights));
-      }
-    } catch (err) {
-      console.warn("[llmwiki] restore pending highlights failed:", err);
+    if (this.highlights.length) {
+      window.requestAnimationFrame(() => {
+        if (!this.disposed) applyHighlights(this.highlights);
+      });
     }
   }
 
@@ -844,61 +851,7 @@ class HighlightController {
   }
 
   private captureCleanHtml(): string {
-    const clone = document.documentElement.cloneNode(true) as HTMLElement;
-    clone.querySelectorAll(
-      ".llmwiki-pill, .llmwiki-popover, .llmwiki-toast, #llmwiki-highlight-style",
-    ).forEach((el) => el.remove());
-    clone.querySelectorAll(`mark.${HIGHLIGHT_CLASS}`).forEach((mark) => {
-      const parent = mark.parentNode;
-      if (!parent) return;
-      while (mark.firstChild) parent.insertBefore(mark.firstChild, mark);
-      parent.removeChild(mark);
-    });
-
-    this.normalizeImageUrls(clone);
-    return clone.outerHTML;
-  }
-
-  // No client-side image fetching: resolve each image to its best absolute
-  // URL and let the API's server-side fetcher rehost it.
-  private normalizeImageUrls(clone: HTMLElement): void {
-    const liveImages = Array.from(document.images);
-    const cloneImages = Array.from(clone.querySelectorAll("img"));
-    const candidates = liveImages
-      .map((img, index) => {
-        const { width, height } = imageDimensions(img);
-        const src = candidateImageUrl(img);
-        const inArticle = !!img.closest("article, main, [role='main']");
-        const hasKnownSize = width > 0 && height > 0;
-        const area = hasKnownSize ? width * height : 120_000;
-        return {
-          index,
-          src,
-          width,
-          height,
-          inArticle,
-          hasKnownSize,
-          score: (inArticle ? 10_000_000 : 0) + area,
-        };
-      })
-      .filter((item) => {
-        if (!item.src || item.src.startsWith("data:") || item.src.startsWith("blob:")) return false;
-        if (!/^https?:\/\//i.test(item.src)) return false;
-        if (item.width >= 80 && item.height >= 50) return true;
-        return item.inArticle && !item.hasKnownSize;
-      })
-      .sort((a, b) => b.score - a.score)
-      .slice(0, MAX_CAPTURED_IMAGES);
-
-    for (const item of candidates) {
-      const cloneImg = cloneImages[item.index];
-      if (!cloneImg) continue;
-      cloneImg.setAttribute("src", item.src);
-      cloneImg.removeAttribute("srcset");
-      cloneImg.removeAttribute("sizes");
-      if (item.width) cloneImg.setAttribute("width", String(item.width));
-      if (item.height) cloneImg.setAttribute("height", String(item.height));
-    }
+    return capturePageHtml();
   }
 
   private async resolveKnowledgeBaseId(): Promise<string | null> {
@@ -964,6 +917,12 @@ class HighlightController {
       this.showToast("Article saved with highlight");
       return true;
     } catch (err) {
+      const message = err instanceof Error ? err.message : "";
+      if (message.includes("too large to save") || message.includes("too complex to save")) {
+        console.warn("[llmwiki] page capture rejected:", err);
+        this.showToast("Page is too large to save");
+        return false;
+      }
       console.warn("[llmwiki] auto-save failed; cached locally:", err);
       this.savePendingPageState();
       this.showToast("Saved locally; will retry");
@@ -1050,6 +1009,7 @@ class HighlightController {
   }
 
   private scheduleSave() {
+    if (this.disposed) return;
     if (this.saveTimer) {
       window.clearTimeout(this.saveTimer);
     }

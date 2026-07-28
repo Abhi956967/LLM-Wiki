@@ -1,21 +1,24 @@
 'use client'
 
 import * as React from 'react'
-import { useSearchParams } from 'next/navigation'
+import { useRouter, useSearchParams } from 'next/navigation'
 import dynamic from 'next/dynamic'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Upload as UploadIcon, BookOpen, ArrowUpRight, Loader2 } from 'lucide-react'
+import { Upload as UploadIcon, BookOpen, ArrowUpRight, Loader2, PlugZap } from 'lucide-react'
 import { useUserStore, useUploadStore } from '@/stores'
 import { useKBDocuments } from '@/hooks/useKBDocuments'
 import { apiFetch } from '@/lib/api'
+import { refreshAccessToken } from '@/lib/auth-token'
 import { toast } from 'sonner'
 import { KBSidenav } from '@/components/kb/KBSidenav'
+import { openMcpConnectionDock } from '@/components/connections/McpConnectionDock'
 import { SelectionActionBar } from '@/components/kb/SelectionActionBar'
 import { WikiContent } from '@/components/wiki/WikiContent'
 import type { DocumentListItem, WikiNode } from '@/lib/types'
 import type { ViewMode } from '@/components/kb/viewMode'
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+const isLocal = process.env.NEXT_PUBLIC_MODE === 'local'
 
 const FilesGrid = dynamic(() => import('@/components/kb/FilesGrid').then((mod) => mod.FilesGrid), {
   ssr: false,
@@ -128,6 +131,7 @@ type Props = {
 }
 
 export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Props) {
+  const router = useRouter()
   const searchParams = useSearchParams()
   const token = useUserStore((s) => s.accessToken)
   const userId = useUserStore((s) => s.user?.id)
@@ -616,6 +620,7 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
   const tusUploadFile = React.useCallback(async (file: File, targetPath: string = '/'): Promise<void> => {
     const t = getToken()
     if (!t) return Promise.reject(new Error('Not authenticated'))
+    const uploadToken = await refreshAccessToken(t).catch(() => null) ?? t
     const uploadId = crypto.randomUUID()
     addUpload({ id: uploadId, filename: file.name, kbId, kbSlug, path: targetPath })
     const { Upload } = await import('tus-js-client')
@@ -624,7 +629,13 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
         endpoint: `${API_URL}/v1/uploads`,
         retryDelays: [0, 1000, 3000, 5000],
         metadata: { filename: file.name, knowledge_base_id: kbId, path: targetPath },
-        headers: { Authorization: `Bearer ${t}` },
+        headers: { Authorization: `Bearer ${uploadToken}` },
+        onBeforeRequest: (request) => {
+          // Long-running uploads span multiple TUS requests. Supabase can
+          // rotate the access token between chunks, so read it at send time.
+          const latestToken = useUserStore.getState().accessToken ?? uploadToken
+          request.setHeader('Authorization', `Bearer ${latestToken}`)
+        },
         onProgress: (sent, total) => setUploadProgress(uploadId, total > 0 ? sent / total : 0),
         onError: (error) => { markUploadFailed(uploadId); reject(error) },
         onSuccess: () => { markUploadProcessing(uploadId); resolve() },
@@ -819,6 +830,8 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
             graphViewActive={graphViewActive}
             onGraphToggle={handleGraphToggle}
             onOpenSourceDoc={handleOpenSourceDoc}
+            recentActive={false}
+            onRecentSelect={() => router.push(`/wikis/${kbSlug}`)}
           />
         </div>
         <div className="flex-1 min-w-0">
@@ -920,7 +933,7 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
                 <div className="text-center max-w-sm">
                   <h3 className="text-base font-medium mb-1.5">No wiki yet</h3>
                   <p className="text-sm text-muted-foreground leading-relaxed">
-                    Add some sources, then ask Claude to compile a wiki from them.
+                    Connect an AI to create the first pages, or add sources for it to work from.
                   </p>
                 </div>
                 <div className="flex items-center gap-3 mt-2">
@@ -929,17 +942,28 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
                     className="inline-flex items-center gap-2 rounded-full bg-foreground text-background px-5 py-2 text-sm font-medium hover:opacity-90 transition-opacity cursor-pointer"
                   >
                     <UploadIcon className="size-3.5 opacity-60" />
-                    Upload Sources
+                    Upload sources
                   </button>
-                  <a
-                    href="https://claude.ai"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="inline-flex items-center gap-2 rounded-full border border-border px-5 py-2 text-sm font-medium hover:bg-accent transition-colors"
-                  >
-                    Open Claude
-                    <ArrowUpRight className="size-3.5 opacity-60" />
-                  </a>
+                  {isLocal ? (
+                    <a
+                      href="https://claude.ai"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-2 rounded-full border border-border px-5 py-2 text-sm font-medium hover:bg-accent transition-colors"
+                    >
+                      Open Claude
+                      <ArrowUpRight className="size-3.5 opacity-60" />
+                    </a>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={openMcpConnectionDock}
+                      className="inline-flex items-center gap-2 rounded-full border border-border px-5 py-2 text-sm font-medium hover:bg-accent transition-colors"
+                    >
+                      Connect AI
+                      <PlugZap className="size-3.5 text-accent-blue" />
+                    </button>
+                  )}
                 </div>
               </motion.div>
             )}

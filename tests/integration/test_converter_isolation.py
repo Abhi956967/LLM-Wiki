@@ -33,6 +33,7 @@ class RecordingS3:
         self.download_to_file_calls = []
         self.presigned_get_calls = []
         self.presigned_put_calls = []
+        self.delete_prefix_calls = []
 
     async def upload_file(self, key: str, file_path: str, content_type: str):
         self.upload_file_calls.append((key, file_path, content_type))
@@ -57,13 +58,44 @@ class RecordingS3:
         self.presigned_put_calls.append((key, content_type, expires_in))
         return f"https://s3.local/put/{quote(key, safe='')}"
 
+    async def delete_prefix(self, prefix: str):
+        self.delete_prefix_calls.append(prefix)
+
 
 class RecordingPool:
-    def __init__(self):
+    def __init__(self, *, storage_limit=1_000_000, current_bytes=0):
         self.execute_calls = []
+        self.storage_limit = storage_limit
+        self.current_bytes = current_bytes
+
+    async def acquire(self):
+        return self
+
+    async def release(self, conn):
+        assert conn is self
+
+    def transaction(self):
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
 
     async def execute(self, query: str, *args):
         self.execute_calls.append((query, args))
+
+    async def fetchrow(self, query: str, *args):
+        assert "storage_limit_bytes" in query
+        return {"storage_limit_bytes": self.storage_limit}
+
+    async def fetchval(self, query: str, *args):
+        if "knowledge_bases" in query:
+            return "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        if "SUM(file_size)" in query:
+            return self.current_bytes
+        raise AssertionError(query)
 
 
 async def test_s3_key_isolation_ignores_filename_and_path_metadata(monkeypatch, tmp_path):
@@ -104,6 +136,41 @@ async def test_s3_key_isolation_ignores_filename_and_path_metadata(monkeypatch, 
         )
     ]
     assert ".." not in s3.upload_file_calls[0][0]
+    assert not temp_path.exists()
+    assert upload.upload_id not in tus._uploads
+
+
+async def test_tus_finalize_rechecks_quota_and_cleans_uploaded_object(monkeypatch, tmp_path):
+    from infra import tus
+
+    tus._uploads.clear()
+    temp_path = tmp_path / "quota-upload.pdf"
+    temp_path.write_bytes(b"%PDF-1.4")
+    upload = tus.TusUpload(
+        upload_id="quota-upload",
+        user_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        upload_length=8,
+        upload_offset=8,
+        filename="quota.pdf",
+        knowledge_base_id="11111111-1111-1111-1111-111111111111",
+        temp_path=temp_path,
+    )
+    tus._uploads[upload.upload_id] = upload
+    fixed_document_id = UUID("33333333-3333-3333-3333-333333333333")
+    monkeypatch.setattr(tus, "uuid4", lambda: fixed_document_id)
+
+    s3 = RecordingS3()
+    pool = RecordingPool(storage_limit=10, current_bytes=4)
+    app_state = SimpleNamespace(s3_service=s3, pool=pool, ocr_service=None)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await tus._finalize(upload, app_state)
+
+    assert excinfo.value.status_code == 413
+    assert s3.delete_prefix_calls == [
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/"
+        "33333333-3333-3333-3333-333333333333/"
+    ]
     assert not temp_path.exists()
     assert upload.upload_id not in tus._uploads
 
@@ -167,6 +234,103 @@ async def test_presigned_urls_are_scoped_to_exact_document_keys(monkeypatch):
         ("user-a/doc-a/converted.pdf", "application/pdf", 3600),
         ("user-b/doc-b/converted.pdf", "application/pdf", 3600),
     ]
+
+
+async def test_converter_extract_retries_capacity_response(monkeypatch):
+    ocr = _import_ocr_module(monkeypatch)
+    service = ocr.OCRService(RecordingS3(), pool=None)
+    statuses = [503, 503, 200]
+    attempts: list[str] = []
+    sleeps: list[float] = []
+
+    class FakeResponse:
+        def __init__(self, status_code: int, request_id: str):
+            self.status_code = status_code
+            self.headers = {"retry-after": "0"}
+            self._request_id = request_id
+
+        def raise_for_status(self):
+            if self.status_code != 200:
+                raise AssertionError("retryable response was not retried")
+
+        def json(self):
+            return {
+                "request_id": self._request_id,
+                "pages": [{"page": 1, "content": "recovered"}],
+            }
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, json, headers):
+            attempts.append(json["request_id"])
+            return FakeResponse(statuses.pop(0), json["request_id"])
+
+    async def fake_sleep(delay: float):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(ocr.settings, "CONVERTER_URL", "https://converter.test")
+    monkeypatch.setattr(ocr.httpx, "AsyncClient", lambda *args, **kwargs: FakeClient())
+    monkeypatch.setattr(ocr.asyncio, "sleep", fake_sleep)
+
+    pages = await service._call_converter_extract("https://s3.test/source.pdf", "pdf")
+
+    assert pages == [(1, "recovered")]
+    assert len(attempts) == 3
+    assert len(set(attempts)) == 1
+    assert sleeps == [0.0, 0.0]
+
+
+async def test_converter_extract_requests_are_bounded(monkeypatch):
+    ocr = _import_ocr_module(monkeypatch)
+    service = ocr.OCRService(RecordingS3(), pool=None)
+    active = 0
+    peak = 0
+
+    class FakeResponse:
+        status_code = 200
+        headers = {}
+
+        def __init__(self, request_id: str):
+            self._request_id = request_id
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "request_id": self._request_id,
+                "pages": [{"page": 1, "content": "ok"}],
+            }
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, json, headers):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return FakeResponse(json["request_id"])
+
+    monkeypatch.setattr(ocr.settings, "CONVERTER_URL", "https://converter.test")
+    monkeypatch.setattr(ocr.httpx, "AsyncClient", lambda *args, **kwargs: FakeClient())
+
+    await asyncio.gather(*(
+        service._call_converter_extract(f"https://s3.test/{i}.pdf", "pdf")
+        for i in range(5)
+    ))
+
+    assert peak == ocr.MAX_CONCURRENT_CONVERTER_REQUESTS == 2
 
 
 def test_tus_upload_namespace_isolation():
@@ -238,6 +402,31 @@ async def test_ocr_service_has_no_shared_mutable_state_between_requests(monkeypa
     ]
 
 
+async def test_hosted_ocr_refuses_all_in_process_parser_fallbacks(monkeypatch):
+    ocr = _import_ocr_module(monkeypatch)
+    s3 = RecordingS3()
+    service = ocr.OCRService(s3, pool=None)
+
+    monkeypatch.setattr(ocr.settings, "MODE", "hosted")
+    monkeypatch.setattr(ocr.settings, "PDF_BACKEND", "opendataloader")
+    monkeypatch.setattr(ocr.settings, "CONVERTER_URL", "")
+
+    with pytest.raises(RuntimeError, match="isolated converter"):
+        await service._process_pdf(
+            "doc-a", "user-a", "kb-a", "user-a/doc-a/source.pdf",
+        )
+    with pytest.raises(RuntimeError, match="isolated converter"):
+        await service._process_office(
+            "doc-a", "user-a", "kb-a", "user-a/doc-a/source.docx", "docx",
+        )
+    with pytest.raises(RuntimeError, match="isolated converter"):
+        await service._convert_to_pdf_s3(
+            "doc-a", "user-a", "user-a/doc-a/source.docx", "docx",
+        )
+
+    assert s3.download_to_file_calls == []
+
+
 async def test_process_opendataloader_uses_isolated_tempdirs_under_concurrency(monkeypatch):
     ocr = _import_ocr_module(monkeypatch)
     s3 = RecordingS3()
@@ -275,7 +464,7 @@ async def test_process_opendataloader_uses_isolated_tempdirs_under_concurrency(m
         return None
 
     monkeypatch.setattr(ocr.tempfile, "TemporaryDirectory", RecordingTemporaryDirectory)
-    monkeypatch.setattr(ocr, "extract_pdf", fake_extract_pdf)
+    monkeypatch.setattr(ocr, "_extract_pdf_in_process", fake_extract_pdf)
     monkeypatch.setattr(service, "_store_extracted_pages", fake_store_extracted_pages)
     monkeypatch.setattr(service, "_build_pdf_assets", fake_build_pdf_assets)
     monkeypatch.setattr(service, "_upload_assets", fake_upload_assets)

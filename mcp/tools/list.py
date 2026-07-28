@@ -10,7 +10,7 @@ def register(mcp: FastMCP, get_user_id, fs_factory) -> None:
     @mcp.tool(
         name="create_knowledge_base",
         description=(
-            "Create a new knowledge base and scaffold starter overview/log pages.\n\n"
+            "Create a new knowledge base and scaffold its starter overview page.\n\n"
             "Set kind='course' to create a course instead of a wiki — same structure, but the "
             "app renders lesson progress (mark-complete, current/locked lessons). Default 'wiki'.\n\n"
             "In hosted mode this creates a separate knowledge base with a unique slug. "
@@ -50,7 +50,7 @@ def register(mcp: FastMCP, get_user_id, fs_factory) -> None:
         label = "course" if kind == "course" else "knowledge base"
         return (
             f"Created {label} **{kb['name']}** (`{kb['slug']}`). "
-            "Starter pages were added at `/wiki/overview.md` and `/wiki/log.md`. "
+            "A starter page was added at `/wiki/overview.md`. "
             f"Use `knowledge_base=\"{kb['slug']}\"` with the other tools."
         )
 

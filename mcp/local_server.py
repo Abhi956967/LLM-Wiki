@@ -56,11 +56,8 @@ async def _init_workspace(workspace_path: str) -> None:
             "---\n\n"
             f"This wiki tracks research on {ws_name}.\n\n"
             "## Key Findings\n\n"
-            "No sources ingested yet.\n\n"
-            "## Recent Updates\n\n"
-            "No activity yet."
+            "No sources ingested yet."
         )
-        log_content = "Chronological record of ingests, queries, and maintenance passes."
 
         await fs.create_document(
             ws_id, "overview.md", "Overview", "/wiki/", "md",
@@ -69,18 +66,9 @@ async def _init_workspace(workspace_path: str) -> None:
             date=today,
             metadata={"description": f"Research hub for {ws_name}."},
         )
-        await fs.create_document(
-            ws_id, "log.md", "Log", "/wiki/", "md",
-            log_content,
-            ["log"],
-        )
-
         overview_path = ws / "wiki" / "overview.md"
         if not overview_path.exists():
             overview_path.write_text(overview_content + "\n", encoding="utf-8")
-        log_path = ws / "wiki" / "log.md"
-        if not log_path.exists():
-            log_path.write_text(log_content + "\n", encoding="utf-8")
 
         logger.info("Initialized workspace: %s", ws)
     else:

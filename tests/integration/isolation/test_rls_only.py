@@ -5,16 +5,22 @@ If isolation holds, only Postgres Row-Level Security blocked cross-tenant access
 This proves RLS works independently of the application layer.
 """
 
+import asyncpg
 import pytest
 
 from tests.integration.isolation.conftest import (
-    USER_A_ID, USER_B_ID,
-    KB_A_ID, KB_B_ID,
-    DOC_A_ID, DOC_B_ID,
-    DOC_A2_ID, DOC_B2_ID,
-    KEY_A_ID, KEY_B_ID,
-    PAGE_A_ID, PAGE_B_ID,
-    REF_A_ID, REF_B_ID,
+    DOC_A2_ID,
+    DOC_A_ID,
+    DOC_B_ID,
+    KB_A_ID,
+    KB_B_ID,
+    KEY_B_ID,
+    PAGE_A_ID,
+    PAGE_B_ID,
+    REF_A_ID,
+    REF_B_ID,
+    USER_A_ID,
+    USER_B_ID,
 )
 
 
@@ -41,6 +47,85 @@ class TestRLSBlocksKnowledgeBases:
             )
         assert row is not None
         assert row["slug"] == "alice-kb"
+
+
+class TestRLSBlocksKnowledgeBaseEvents:
+    """Event isolation must hold with no application-level ownership filters."""
+
+    async def test_list_events_only_returns_own(self, rls_session):
+        async with rls_session(USER_A_ID) as conn:
+            rows = await conn.fetch(
+                "SELECT knowledge_base_id::text, user_id::text, subject_title "
+                "FROM knowledge_base_events ORDER BY id"
+            )
+
+        assert rows
+        assert {row["knowledge_base_id"] for row in rows} == {KB_A_ID}
+        assert {row["user_id"] for row in rows} == {USER_A_ID}
+        titles = {row["subject_title"] for row in rows}
+        assert "Alice KB" in titles
+        assert "Bob KB" not in titles
+
+    async def test_get_other_kb_events_returns_nothing(self, rls_session):
+        async with rls_session(USER_A_ID) as conn:
+            rows = await conn.fetch(
+                "SELECT id FROM knowledge_base_events WHERE knowledge_base_id = $1",
+                KB_B_ID,
+            )
+        assert rows == []
+
+    async def test_isolation_is_bidirectional(self, rls_session):
+        async with rls_session(USER_B_ID) as conn:
+            rows = await conn.fetch(
+                "SELECT knowledge_base_id::text, user_id::text, subject_title "
+                "FROM knowledge_base_events ORDER BY id"
+            )
+
+        assert rows
+        assert {row["knowledge_base_id"] for row in rows} == {KB_B_ID}
+        assert {row["user_id"] for row in rows} == {USER_B_ID}
+        titles = {row["subject_title"] for row in rows}
+        assert "Bob KB" in titles
+        assert "Alice KB" not in titles
+
+    async def test_authenticated_role_cannot_insert_events(self, rls_session):
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            async with rls_session(USER_A_ID) as conn:
+                await conn.execute(
+                    "INSERT INTO knowledge_base_events "
+                    "(knowledge_base_id, user_id, event_type, subject_kind, subject_title) "
+                    "VALUES ($1, $2, 'wiki.created', 'wiki', 'forged')",
+                    KB_A_ID,
+                    USER_A_ID,
+                )
+
+    async def test_authenticated_role_cannot_update_events(self, rls_session):
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            async with rls_session(USER_A_ID) as conn:
+                await conn.execute(
+                    "UPDATE knowledge_base_events SET subject_title = 'tampered' "
+                    "WHERE knowledge_base_id = $1",
+                    KB_A_ID,
+                )
+
+    async def test_authenticated_role_cannot_delete_events(self, rls_session):
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            async with rls_session(USER_A_ID) as conn:
+                await conn.execute(
+                    "DELETE FROM knowledge_base_events WHERE knowledge_base_id = $1",
+                    KB_A_ID,
+                )
+
+    async def test_authenticated_role_cannot_call_event_writer(self, rls_session):
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            async with rls_session(USER_A_ID) as conn:
+                await conn.execute(
+                    "SELECT insert_kb_event("
+                    "document_row, 'page.updated', '[]'::jsonb, "
+                    "'forged:event', now()) "
+                    "FROM documents AS document_row WHERE document_row.id = $1",
+                    DOC_A_ID,
+                )
 
 
 class TestRLSBlocksDocuments:

@@ -9,13 +9,20 @@ import rehypeKatex from 'rehype-katex'
 import 'katex/dist/katex.min.css'
 import type { Components } from 'react-markdown'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
-import { FileText, Copy, Check, Network, ChevronLeft, ChevronRight, ArrowRight } from 'lucide-react'
+import { FileText, Copy, Check, CircleAlert, Network, ChevronLeft, ChevronRight, ArrowRight, Trash2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { apiFetch } from '@/lib/api'
+import { parsePlanTasks, type PlanSummary, type TaskStatus } from '@/lib/planTasks'
+import { decodeUnicodeEscapes } from '@/lib/text'
 import { useUserStore } from '@/stores'
 import { ExpandableMedia } from './DiagramViewer'
 import { WikiHighlighter } from './WikiHighlighter'
+import { WikiComments } from './WikiComments'
+import { useWikiHighlights } from '@/hooks/useWikiHighlights'
 import type { DocumentListItem } from '@/lib/types'
+
+const REMARK_PLUGINS = [remarkGfm, remarkMath, remarkFixOverescapedMath, remarkTaskStatus]
+const REHYPE_PLUGINS = [rehypeKatex]
 
 const MermaidBlock = dynamic(() => import('./MermaidBlock').then((mod) => mod.MermaidBlock), {
   ssr: false,
@@ -26,10 +33,48 @@ const MermaidBlock = dynamic(() => import('./MermaidBlock').then((mod) => mod.Me
   ),
 })
 
+const QuizBlock = dynamic(() => import('./QuizBlock').then((mod) => mod.QuizBlock), {
+  ssr: false,
+  loading: () => (
+    <pre className="my-3 overflow-x-auto rounded-lg border border-border bg-muted/60 p-4 text-[13px] leading-relaxed">
+      Loading quiz...
+    </pre>
+  ),
+})
+
+// A fenced code block reaches the `pre` renderer as a single <code> child whose
+// className carries the fence language.
+function fenceInfo(child: React.ReactNode): { language: string; text: string } | null {
+  if (!React.isValidElement(child)) return null
+  const props = child.props
+  if (typeof props !== 'object' || props === null || !('className' in props)) return null
+  const className = (props as { className?: unknown }).className
+  if (typeof className !== 'string') return null
+  const match = className.match(/language-(\w+)/)
+  if (!match) return null
+  const text = 'children' in props ? String((props as { children?: unknown }).children).replace(/\n$/, '') : ''
+  return { language: match[1], text }
+}
+
 export interface TocItem {
   id: string
   text: string
   level: 2 | 3
+}
+
+function displayHeadingText(text: string): string {
+  return text.trim().toLowerCase() === 'checkpoint' ? 'Quiz' : text
+}
+
+// Older generated lessons wrapped the self-labeling widget in a redundant
+// "Checkpoint" section (often with this stock prompt). Remove only that exact
+// wrapper when it directly introduces a quiz; the fenced source stays byte-for-byte
+// unchanged so persisted question keys remain valid.
+export function stripLegacyQuizWrapper(md: string): string {
+  return md.replace(
+    /^#{2,3}[ \t]+Checkpoint[ \t]*\r?\n(?:[ \t]*\r?\n)*(?:Try to answer without looking back\.[ \t]*\r?\n(?:[ \t]*\r?\n)*)?(?=```quiz[ \t]*(?:\r?\n|$))/gim,
+    '',
+  )
 }
 
 export function extractTocFromMarkdown(md: string): TocItem[] {
@@ -40,10 +85,10 @@ export function extractTocFromMarkdown(md: string): TocItem[] {
     const m3 = line.match(/^###\s+(.+)/)
     if (m2) {
       const text = m2[1].replace(/\*\*/g, '').replace(/\[([^\]]+)\]\([^)]*\)/g, '$1').trim()
-      items.push({ id: slugify(text), text, level: 2 })
+      items.push({ id: slugify(text), text: displayHeadingText(text), level: 2 })
     } else if (m3) {
       const text = m3[1].replace(/\*\*/g, '').replace(/\[([^\]]+)\]\([^)]*\)/g, '$1').trim()
-      items.push({ id: slugify(text), text, level: 3 })
+      items.push({ id: slugify(text), text: displayHeadingText(text), level: 3 })
     }
   }
   return items
@@ -69,7 +114,8 @@ function parseFrontmatterField(content: string, field: string): string | null {
   if (!fm) return null
   const line = fm[0].match(new RegExp(`^${field}:[ \\t]*(.+)$`, 'm'))
   if (!line) return null
-  return line[1].trim().replace(/^["']|["']$/g, '') || null
+  const value = line[1].trim().replace(/^["']|["']$/g, '')
+  return value ? decodeUnicodeEscapes(value) : null
 }
 
 // The page title is the body's leading H1; lift it into the chrome header so the eyebrow
@@ -179,6 +225,81 @@ function remarkFixOverescapedMath() {
     node.children?.forEach(restore)
   }
   return restore
+}
+
+interface TaskListItem extends MdastLike {
+  checked?: boolean | null
+  data?: { hProperties?: Record<string, unknown> }
+}
+
+const EXTENDED_TASK_MARKER_RE = /^\[([~!])\](?:[ \t]+|$)/
+
+// remark-gfm only parses [ ]/[x]; the plan convention adds [~] in-progress and
+// [!] blocked, which arrive as literal text. Tag every task item with data-task
+// so the li renderer draws one glyph vocabulary for all four states.
+export function remarkTaskStatus() {
+  const visit = (node: TaskListItem): void => {
+    if (node.type === 'listItem') {
+      let status: TaskStatus | null = null
+      if (node.checked === true) status = 'done'
+      else if (node.checked === false) status = 'todo'
+      else {
+        const paragraph = node.children?.[0]
+        const text = paragraph?.type === 'paragraph' ? paragraph.children?.[0] : undefined
+        if (text?.type === 'text' && typeof text.value === 'string') {
+          const marker = text.value.match(EXTENDED_TASK_MARKER_RE)
+          if (marker) {
+            status = marker[1] === '~' ? 'in_progress' : 'blocked'
+            text.value = text.value.slice(marker[0].length)
+          }
+        }
+      }
+      if (status) {
+        node.data = node.data ?? {}
+        node.data.hProperties = { ...node.data.hProperties, 'data-task': status }
+      }
+    }
+    node.children?.forEach(visit)
+  }
+  return visit
+}
+
+function TaskGlyph({ status }: { status: string }) {
+  if (status === 'done') return <Check className="size-3.5 text-emerald-500" />
+  if (status === 'in_progress') return <span className="size-1.5 rounded-full bg-foreground" />
+  if (status === 'blocked') return <CircleAlert className="size-3.5 text-amber-500" />
+  return <span className="size-2.5 rounded-full border border-border" />
+}
+
+function PlanProgressHeader({ summary }: { summary: PlanSummary }) {
+  return (
+    <div className="mb-8">
+      <div className="flex items-center gap-3">
+        <div className="h-1 flex-1 overflow-hidden rounded-full bg-muted">
+          <div
+            className="h-full bg-foreground/30 transition-[width]"
+            style={{ width: `${Math.round((summary.done / summary.total) * 100)}%` }}
+          />
+        </div>
+        <span className="text-[11px] text-muted-foreground/50 tabular-nums">
+          {summary.done}/{summary.total}
+        </span>
+      </div>
+      <div className="mt-3 space-y-1">
+        {summary.stages.map((stage, index) => (
+          <div key={index} className="flex items-baseline justify-between gap-4 text-xs">
+            <span className="min-w-0 truncate text-muted-foreground">{stage.title || 'Tasks'}</span>
+            <span className="shrink-0 tabular-nums text-muted-foreground/60">
+              {stage.done}/{stage.total}
+              {stage.counts.blocked > 0 && (
+                <span className="text-amber-500"> · {stage.counts.blocked} blocked</span>
+              )}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
 }
 
 function TableOfContents({ items }: { items: TocItem[] }) {
@@ -362,13 +483,11 @@ function CitationBadge({
 function WikiImage({
   src,
   alt,
-  documents,
-  wikiActivePath,
+  documentsRef,
 }: {
   src?: string
   alt?: string
-  documents?: DocumentListItem[]
-  wikiActivePath?: string
+  documentsRef: React.RefObject<DocumentListItem[] | undefined>
 }) {
   const token = useUserStore((s) => s.accessToken)
   const [svgContent, setSvgContent] = React.useState<string | null>(null)
@@ -376,12 +495,19 @@ function WikiImage({
   const [loading, setLoading] = React.useState(false)
 
   React.useEffect(() => {
+    // Stable renderer identities mean React reuses this component across page
+    // navigations — always drop the previous page's resolved image first.
+    setSvgContent(null)
+    setImageUrl(null)
+    setLoading(false)
+
+    const documents = documentsRef.current
     if (!src || !documents || !token) return
     // Only resolve relative paths (not http:// or data: URIs)
     if (src.startsWith('http') || src.startsWith('data:')) return
 
     // Resolve relative path: strip leading ./ and resolve against current wiki path
-    let filename = src.replace(/^\.\//, '')
+    const filename = src.replace(/^\.\//, '')
     const doc = documents.find((d) => {
       return d.filename === filename || d.filename === filename.split('/').pop()
     })
@@ -391,13 +517,16 @@ function WikiImage({
     const isSvg = doc.file_type === 'svg'
     const isTextAsset = ['svg', 'csv', 'xml', 'html'].includes(doc.file_type)
     const isImageBinary = ['png', 'jpg', 'jpeg', 'webp', 'gif'].includes(doc.file_type)
+    if (!isTextAsset && !isImageBinary) return
 
+    let cancelled = false
     setLoading(true)
 
     if (isSvg || isTextAsset) {
       // Text-based assets stored in the content column — fetch via API
       apiFetch<{ content: string }>(`/v1/documents/${doc.id}/content`, token)
         .then((res) => {
+          if (cancelled) return
           if (isSvg && res.content) {
             setSvgContent(res.content)
           } else if (res.content) {
@@ -407,17 +536,25 @@ function WikiImage({
           }
         })
         .catch(() => { /* silent fail — image just won't render */ })
-        .finally(() => setLoading(false))
-    } else if (isImageBinary) {
+        .finally(() => {
+          if (!cancelled) setLoading(false)
+        })
+    } else {
       // Binary images stored in S3 — use the /url endpoint
       apiFetch<{ url: string }>(`/v1/documents/${doc.id}/url`, token)
-        .then((res) => setImageUrl(res.url))
+        .then((res) => {
+          if (!cancelled) setImageUrl(res.url)
+        })
         .catch(() => { /* silent fail */ })
-        .finally(() => setLoading(false))
-    } else {
-      setLoading(false)
+        .finally(() => {
+          if (!cancelled) setLoading(false)
+        })
     }
-  }, [src, documents, token, wikiActivePath])
+
+    return () => {
+      cancelled = true
+    }
+  }, [src, documentsRef, token])
 
   // Inline SVG rendering
   if (svgContent) {
@@ -468,6 +605,26 @@ function WikiImage({
   )
 }
 
+// Parsing + KaTeX rendering are the expensive part of this page; memoized so
+// parent re-renders (documents churn over the websocket) never re-run them.
+const MarkdownBody = React.memo(function MarkdownBody({
+  content,
+  components,
+}: {
+  content: string
+  components: Components
+}) {
+  return (
+    <ReactMarkdown
+      remarkPlugins={REMARK_PLUGINS}
+      rehypePlugins={REHYPE_PLUGINS}
+      components={components}
+    >
+      {content}
+    </ReactMarkdown>
+  )
+})
+
 interface WikiContentProps {
   content: string
   title: string
@@ -487,6 +644,9 @@ interface WikiContentProps {
   onLessonNavigate?: (path: string) => void
   lessonsTotal?: number
   lessonsComplete?: number
+  prevPage?: LessonLink | null
+  nextPage?: LessonLink | null
+  onDelete?: (() => void) | null
 }
 
 interface LessonLink {
@@ -494,17 +654,42 @@ interface LessonLink {
   path: string
 }
 
-export function WikiContent({ content, title, path, documentId = null, onNavigate, onSourceClick, onGraphClick, documents, courseMode = false, courseView = null, isComplete = false, prevLesson = null, forwardLabel = null, onForward, resumeLesson = null, onLessonNavigate, lessonsTotal = 0, lessonsComplete = 0 }: WikiContentProps) {
+export function WikiContent({ content, title, path, documentId = null, onNavigate, onSourceClick, onGraphClick, documents, courseMode = false, courseView = null, isComplete = false, prevLesson = null, forwardLabel = null, onForward, resumeLesson = null, onLessonNavigate, lessonsTotal = 0, lessonsComplete = 0, prevPage = null, nextPage = null, onDelete = null }: WikiContentProps) {
   const scrollRef = React.useRef<HTMLDivElement | null>(null)
   const markdownRef = React.useRef<HTMLDivElement | null>(null)
+  const remoteVersion = documents?.find((d) => d.id === documentId)?.version ?? null
+  const highlightsApi = useWikiHighlights(documentId, remoteVersion)
+
+  // The markdown renderers must keep stable identities: new renderer functions
+  // are new element types to React, which tears down and remounts the whole
+  // rendered page (losing scroll, reloading images) on any documents churn.
+  // Callbacks and documents flow through refs so `components` never recomputes
+  // for identity-only changes.
+  const onNavigateRef = React.useRef(onNavigate)
+  onNavigateRef.current = onNavigate
+  const onSourceClickRef = React.useRef(onSourceClick)
+  onSourceClickRef.current = onSourceClick
+  const documentsRef = React.useRef(documents)
+  documentsRef.current = documents
+  const documentIdRef = React.useRef(documentId)
+  documentIdRef.current = documentId
+
   const body = React.useMemo(() => stripFrontmatter(content), [content])
   const description = React.useMemo(() => parseFrontmatterField(content, 'description'), [content])
   const { heading, rest } = React.useMemo(() => extractLeadingH1(body), [body])
-  const processedContent = React.useMemo(() => normalizeMathDelimiters(rest), [rest])
-  const pageTitle = toDisplayTitle(heading ?? title)
+  const processedContent = React.useMemo(
+    () => normalizeMathDelimiters(stripLegacyQuizWrapper(rest)),
+    [rest],
+  )
+  const pageTitle = toDisplayTitle(decodeUnicodeEscapes(heading ?? title))
   const eyebrow = React.useMemo(() => pathEyebrow(path), [path])
   const tocItems = React.useMemo(() => extractTocFromMarkdown(processedContent), [processedContent])
   const footnoteSources = React.useMemo(() => parseFootnoteSources(processedContent), [processedContent])
+  const isPlanPage = path === 'plan.md'
+  const planSummary = React.useMemo(
+    () => (isPlanPage ? parsePlanTasks(processedContent) : null),
+    [isPlanPage, processedContent],
+  )
   const [copied, setCopied] = React.useState(false)
 
   const handleCopy = React.useCallback(() => {
@@ -528,18 +713,20 @@ export function WikiContent({ content, title, path, documentId = null, onNavigat
       h2({ children }) {
         const text = childrenToText(children)
         const id = slugify(text)
+        const displayText = displayHeadingText(text)
         return (
           <h2 id={id} className="text-xl font-semibold tracking-tight mt-6 mb-2 pt-2 border-t border-border/50 first:border-0 first:pt-0 scroll-mt-20">
-            {children}
+            {displayText === text ? children : displayText}
           </h2>
         )
       },
       h3({ children }) {
         const text = childrenToText(children)
         const id = slugify(text)
+        const displayText = displayHeadingText(text)
         return (
           <h3 id={id} className="text-lg font-medium tracking-tight mt-6 mb-1.5 scroll-mt-20">
-            {children}
+            {displayText === text ? children : displayText}
           </h3>
         )
       },
@@ -557,19 +744,18 @@ export function WikiContent({ content, title, path, documentId = null, onNavigat
       },
       pre({ children, ...props }) {
         const child = React.Children.toArray(children)[0]
-        if (
-          React.isValidElement(child) &&
-          typeof child.props === 'object' &&
-          child.props !== null &&
-          'className' in child.props &&
-          typeof child.props.className === 'string' &&
-          child.props.className.includes('language-mermaid')
-        ) {
-          const text =
-            'children' in child.props
-              ? String(child.props.children).replace(/\n$/, '')
-              : ''
-          return <MermaidBlock chart={text} />
+        const fence = fenceInfo(child)
+        if (fence?.language === 'mermaid') {
+          return <MermaidBlock chart={fence.text} />
+        }
+        if (fence?.language === 'quiz') {
+          return (
+            <QuizBlock
+              source={fence.text}
+              documentId={documentIdRef.current}
+              documentsRef={documentsRef}
+            />
+          )
         }
         return (
           <pre
@@ -627,7 +813,7 @@ export function WikiContent({ content, title, path, documentId = null, onNavigat
         ) {
           return (
             <button
-              onClick={() => onNavigate(href)}
+              onClick={() => onNavigateRef.current(href)}
               className="text-accent-blue underline underline-offset-2 decoration-accent-blue/30 hover:decoration-accent-blue transition-colors cursor-pointer font-medium"
             >
               {children}
@@ -680,7 +866,7 @@ export function WikiContent({ content, title, path, documentId = null, onNavigat
                   num={num}
                   source={source}
                   onSourceClick={(filename, page) => {
-                    if (onSourceClick) onSourceClick(filename, page)
+                    onSourceClickRef.current?.(filename, page)
                   }}
                 />
               </sup>
@@ -757,11 +943,23 @@ export function WikiContent({ content, title, path, documentId = null, onNavigat
               className="my-2 text-sm pl-1 scroll-mt-20"
             >
               <button
-                onClick={() => onSourceClick?.(text)}
+                onClick={() => onSourceClickRef.current?.(text)}
                 className="text-muted-foreground hover:text-foreground hover:underline transition-colors cursor-pointer text-left"
               >
                 {text}
               </button>
+            </li>
+          )
+        }
+        const dp = props as Record<string, unknown>
+        const task = dp['data-task'] ?? dp.dataTask
+        if (typeof task === 'string') {
+          return (
+            <li data-task={task} className="my-1 flex list-none items-start gap-2 leading-[1.65]">
+              <span className="mt-[5px] flex size-3.5 shrink-0 items-center justify-center">
+                <TaskGlyph status={task} />
+              </span>
+              <div className="min-w-0 flex-1">{children}</div>
             </li>
           )
         }
@@ -771,6 +969,10 @@ export function WikiContent({ content, title, path, documentId = null, onNavigat
           </li>
         )
       },
+      input(props) {
+        if (props.type === 'checkbox') return null
+        return <input {...props} />
+      },
       hr() {
         return <hr className="my-6 border-border/60" />
       },
@@ -779,7 +981,7 @@ export function WikiContent({ content, title, path, documentId = null, onNavigat
           <WikiImage
             src={typeof src === 'string' ? src : undefined}
             alt={typeof alt === 'string' ? alt : undefined}
-            documents={documents}
+            documentsRef={documentsRef}
           />
         )
       },
@@ -801,7 +1003,7 @@ export function WikiContent({ content, title, path, documentId = null, onNavigat
                   return (
                     <li key={num} className="text-sm pl-1">
                       <button
-                        onClick={() => onSourceClick?.(filename)}
+                        onClick={() => onSourceClickRef.current?.(filename)}
                         className="text-muted-foreground hover:text-foreground hover:underline transition-colors cursor-pointer text-left"
                       >
                         {source}
@@ -816,7 +1018,7 @@ export function WikiContent({ content, title, path, documentId = null, onNavigat
         return <section {...props}>{children}</section>
       },
     }),
-    [onNavigate, onSourceClick, footnoteSources, documents],
+    [footnoteSources],
   )
 
   const hasToc = tocItems.length > 0
@@ -862,21 +1064,58 @@ export function WikiContent({ content, title, path, documentId = null, onNavigat
                       <Network className="size-3.5" />
                     </button>
                   )}
+                  {onDelete && (
+                    <button
+                      onClick={onDelete}
+                      className="p-1.5 rounded-md text-muted-foreground/40 hover:text-destructive hover:bg-accent transition-colors cursor-pointer"
+                      title="Delete page"
+                    >
+                      <Trash2 className="size-3.5" />
+                    </button>
+                  )}
                 </div>
               </div>
               {description && (
                 <p className="text-[15px] text-muted-foreground mt-2.5 leading-relaxed">{description}</p>
               )}
             </div>
+            {planSummary && planSummary.total > 0 && <PlanProgressHeader summary={planSummary} />}
             <div className="wiki-content text-[15px] leading-relaxed" ref={markdownRef}>
-              <ReactMarkdown
-                remarkPlugins={[remarkGfm, remarkMath, remarkFixOverescapedMath]}
-                rehypePlugins={[rehypeKatex]}
+              <MarkdownBody
+                key={documentId ?? 'unpersisted'}
+                content={processedContent}
                 components={components}
-              >
-                {processedContent}
-              </ReactMarkdown>
+              />
             </div>
+            <WikiComments highlights={highlightsApi.highlights} contentRef={markdownRef} />
+            {!courseMode && (prevPage || nextPage) && (
+              <div className="mt-12 pt-5 border-t border-border flex items-center justify-between gap-4">
+                {prevPage ? (
+                  <button
+                    onClick={() => onNavigate(prevPage.path)}
+                    className="flex items-center gap-1.5 min-w-0 text-[13px] text-muted-foreground/60 hover:text-foreground transition-colors cursor-pointer"
+                    title={`Previous: ${prevPage.title}`}
+                  >
+                    <ChevronLeft className="size-4 shrink-0" />
+                    <span className="truncate max-w-[220px]">{prevPage.title}</span>
+                  </button>
+                ) : (
+                  <span className="w-6" />
+                )}
+                {nextPage ? (
+                  <button
+                    onClick={() => onNavigate(nextPage.path)}
+                    className="flex items-center justify-end gap-1.5 min-w-0 text-[13px] font-medium text-foreground/80 hover:text-foreground transition-colors cursor-pointer"
+                    title={`Next: ${nextPage.title}`}
+                  >
+                    <span className="truncate max-w-[220px]">{nextPage.title}</span>
+                    <ChevronRight className="size-4 shrink-0" />
+                  </button>
+                ) : (
+                  <span className="w-6" />
+                )}
+              </div>
+            )}
             {courseMode && courseView === 'overview' && resumeLesson && (
               <div className="mt-12 pt-6 border-t border-border flex items-center justify-between gap-4">
                 <div className="text-[13px] text-muted-foreground">
@@ -946,6 +1185,7 @@ export function WikiContent({ content, title, path, documentId = null, onNavigat
           contentRef={markdownRef}
           documentId={documentId}
           contentKey={processedContent}
+          api={highlightsApi}
         />
       )}
     </div>

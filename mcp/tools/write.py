@@ -1,14 +1,16 @@
 """Write tools — create, edit, and append wiki pages and notes."""
 
 import re
-import yaml
 from datetime import date
 
-from mcp.server.fastmcp import FastMCP, Context
-
+import yaml
 from vaultfs import VaultFS
-from vaultfs.base import DuplicateDocumentError
+from vaultfs.base import DuplicateDocumentError, StorageQuotaExceededError
+
+from mcp.server.fastmcp import Context, FastMCP
+
 from .helpers import deep_link, resolve_path
+from .quiz_lint import QUIZ_SCHEMA_HINT, lint_quiz_blocks
 from .references import update_references
 
 _ASSET_EXTENSIONS = {".svg", ".csv", ".json", ".xml", ".html"}
@@ -16,6 +18,21 @@ _FILE_EXT_RE = re.compile(r"\.(md|txt|svg|csv|json|xml|html)$", re.IGNORECASE)
 _FRONTMATTER_RE = re.compile(r"\A---[ \t]*\n(.+?\n)---[ \t]*\n", re.DOTALL)
 _FOOTNOTE_DEF_RE = re.compile(r"^\[\^([^\]]+)\]:", re.MULTILINE)
 _CONTEXT_LINES = 5
+_MAX_TEXT_CONTENT_BYTES = 10 * 1024 * 1024
+
+
+def _content_size_error(content: str) -> str | None:
+    if len(content.encode("utf-8")) > _MAX_TEXT_CONTENT_BYTES:
+        return "Error: content exceeds the 10 MiB text-document limit."
+    return None
+
+
+def _quiz_block_error(content: str) -> str | None:
+    errors = lint_quiz_blocks(content)
+    if not errors:
+        return None
+    details = "\n".join(f"- {error}" for error in errors)
+    return f"Error: invalid ```quiz block(s) — nothing was written.\n{details}\n{QUIZ_SCHEMA_HINT}"
 
 
 def _parse_frontmatter(content: str) -> dict:
@@ -205,6 +222,14 @@ class WriteHandler:
         title = self._humanize_title(title)
         content = _ensure_wiki_frontmatter(content, title, tags, date_str, dir_path, filename, file_type)
 
+        size_error = _content_size_error(content)
+        if size_error:
+            return size_error
+
+        quiz_error = _quiz_block_error(content)
+        if quiz_error:
+            return quiz_error
+
         effective_tags = _effective_tags(content, tags) or []
         if not effective_tags:
             return "Error: at least one tag is required when creating a note."
@@ -226,14 +251,17 @@ class WriteHandler:
         saved_date = _effective_date(content, date_str)
 
         if existing:
-            await self.fs.update_document(
-                str(existing["id"]),
-                content,
-                effective_tags,
-                title=title,
-                date=saved_date,
-                metadata=fm_metadata,
-            )
+            try:
+                await self.fs.update_document(
+                    str(existing["id"]),
+                    content,
+                    effective_tags,
+                    title=title,
+                    date=saved_date,
+                    metadata=fm_metadata,
+                )
+            except StorageQuotaExceededError as e:
+                return f"Error: {e}"
             doc = existing
         else:
             try:
@@ -253,6 +281,8 @@ class WriteHandler:
                     f"Error: `{dir_path}{filename}` already exists. "
                     f"Use the `edit` tool to modify it, or pass `overwrite=true` to replace it entirely."
                 )
+            except StorageQuotaExceededError as e:
+                return f"Error: {e}"
 
         doc_id = str(doc["id"])
         await self._sync_references(doc_id, content, dir_path, file_type)
@@ -267,10 +297,10 @@ class WriteHandler:
             saved_date,
         ) + impact
 
-    async def edit(self, path: str, old_text: str, new_text: str) -> str:
+    async def edit(self, path: str, old_string: str, new_string: str) -> str:
         """Replace exact text in an existing document."""
-        if not old_text:
-            return "Error: old_text is required for str_replace."
+        if not old_string:
+            return "Error: old_string is required for edit."
 
         dir_path, filename = resolve_path(path)
         doc = await self.fs.get_document(self.kb_id, filename, dir_path)
@@ -278,28 +308,39 @@ class WriteHandler:
             return f"Document '{path}' not found."
 
         content = doc.get("content") or ""
-        error = self._validate_single_match(content, old_text)
+        error = self._validate_single_match(content, old_string)
         if error:
             return error
 
-        replace_start = content.index(old_text)
-        new_content = content.replace(old_text, new_text, 1)
+        replace_start = content.index(old_string)
+        new_content = content.replace(old_string, new_string, 1)
+
+        size_error = _content_size_error(new_content)
+        if size_error:
+            return size_error
+
+        quiz_error = _quiz_block_error(new_content)
+        if quiz_error:
+            return quiz_error
 
         self.fs.write_to_disk(dir_path, filename, new_content)
         meta = _parse_frontmatter(new_content)
         fm_date, fm_metadata = _extract_metadata(meta)
-        await self.fs.update_document(
-            str(doc["id"]),
-            new_content,
-            _effective_tags(new_content, None),
-            date=fm_date,
-            metadata=fm_metadata,
-        )
+        try:
+            await self.fs.update_document(
+                str(doc["id"]),
+                new_content,
+                _effective_tags(new_content, None),
+                date=fm_date,
+                metadata=fm_metadata,
+            )
+        except StorageQuotaExceededError as e:
+            return f"Error: {e}"
 
         doc_id = str(doc["id"])
         await self._sync_references(doc_id, new_content, dir_path)
 
-        snippet = self._extract_context(new_content, replace_start, len(new_text))
+        snippet = self._extract_context(new_content, replace_start, len(new_string))
         impact = await self._get_wiki_impact(doc_id, dir_path)
         return self._format_edit_response(path, dir_path, filename, snippet) + impact
 
@@ -312,16 +353,27 @@ class WriteHandler:
 
         new_content = _append_markdown_section(doc.get("content") or "", content)
 
+        size_error = _content_size_error(new_content)
+        if size_error:
+            return size_error
+
+        quiz_error = _quiz_block_error(new_content)
+        if quiz_error:
+            return quiz_error
+
         self.fs.write_to_disk(dir_path, filename, new_content)
         meta = _parse_frontmatter(new_content)
         fm_date, fm_metadata = _extract_metadata(meta)
-        await self.fs.update_document(
-            str(doc["id"]),
-            new_content,
-            _effective_tags(new_content, None),
-            date=fm_date,
-            metadata=fm_metadata,
-        )
+        try:
+            await self.fs.update_document(
+                str(doc["id"]),
+                new_content,
+                _effective_tags(new_content, None),
+                date=fm_date,
+                metadata=fm_metadata,
+            )
+        except StorageQuotaExceededError as e:
+            return f"Error: {e}"
 
         doc_id = str(doc["id"])
         await self._sync_references(doc_id, new_content, dir_path)
@@ -383,13 +435,13 @@ class WriteHandler:
         """Strip non-word characters and replace spaces with dashes."""
         return re.sub(r"[^\w\s\-.]", "", name.replace(" ", "-"))
 
-    def _validate_single_match(self, content: str, old_text: str) -> str | None:
-        """Return an error string if old_text doesn't match exactly once, else None."""
-        count = content.count(old_text)
+    def _validate_single_match(self, content: str, old_string: str) -> str | None:
+        """Return an error string if old_string doesn't match exactly once, else None."""
+        count = content.count(old_string)
         if count == 0:
-            return "Error: no match found for old_text."
+            return "Error: no match found for old_string."
         if count > 1:
-            return f"Error: found {count} matches for old_text. Provide more context to match exactly once."
+            return f"Error: found {count} matches for old_string. Provide more context to match exactly once."
         return None
 
     def _format_create_response(self, title: str, tags: list[str], dir_path: str, filename: str, file_type: str, date_str: str | None) -> str:
@@ -486,8 +538,8 @@ def register(mcp: FastMCP, get_user_id, fs_factory) -> None:
         name="edit",
         description=(
             "Replace exact text in an existing wiki page or note.\n\n"
-            "Works like find-and-replace: provide the exact text to find (`old_text`) and "
-            "the replacement (`new_text`). The match must be unique — if multiple matches are "
+            "Works like find-and-replace: provide the exact text to find (`old_string`) and "
+            "the replacement (`new_string`). The match must be unique — if multiple matches are "
             "found, provide more surrounding context to disambiguate.\n\n"
             "Read the page first to see its current content before editing."
         ),
@@ -496,13 +548,13 @@ def register(mcp: FastMCP, get_user_id, fs_factory) -> None:
         ctx: Context,
         knowledge_base: str,
         path: str,
-        old_text: str,
-        new_text: str,
+        old_string: str,
+        new_string: str,
     ) -> str:
         handler, err = await _resolve(ctx, knowledge_base)
         if err:
             return err
-        return await handler.edit(path, old_text, new_text)
+        return await handler.edit(path, old_string, new_string)
 
     @mcp.tool(
         name="append",

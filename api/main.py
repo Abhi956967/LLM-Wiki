@@ -41,6 +41,7 @@ if settings.LOGFIRE_TOKEN:
 from routes.health import router as health_router
 from routes.knowledge_bases import router as knowledge_bases_router
 from routes.documents import router as documents_router
+from routes.events import router as events_router
 from routes.me import router as me_router
 from routes.usage import router as usage_router
 
@@ -210,9 +211,20 @@ if settings.MODE != "local":
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
     app.add_middleware(SlowAPIMiddleware)
 
+local_extension_origin_regex = None
+if settings.MODE == "local":
+    from infra.local_http import LocalHTTPBoundaryMiddleware, extension_origin_regex
+
+    local_extension_origin_regex = extension_origin_regex(
+        settings.local_extension_origins,
+    )
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.APP_URL],
+    # Local clipping may be initiated by the popup or extension background
+    # worker. Hosted mode keeps its existing, web-app-only CORS policy.
+    allow_origin_regex=local_extension_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -221,7 +233,20 @@ app.add_middleware(
         "Tus-Resumable", "Tus-Version", "Tus-Max-Size", "Tus-Extension",
         "X-Document-Id",
     ],
+    # Default preflight cache is 600s — on high-latency links every endpoint
+    # re-pays an OPTIONS round-trip every 10 minutes. Browsers cap this
+    # (Chrome 7200s, Firefox 86400s), so ask for the max.
+    max_age=86400,
 )
+
+if settings.MODE == "local":
+    # This is deliberately outside CORS so Host validation also covers
+    # preflights. Local mode has no auth and supports loopback binding only.
+    app.add_middleware(
+        LocalHTTPBoundaryMiddleware,
+        app_origin=settings.APP_URL,
+        extension_origins=settings.local_extension_origins,
+    )
 
 if settings.LOGFIRE_TOKEN:
     import logfire
@@ -232,6 +257,7 @@ app.include_router(me_router)
 app.include_router(usage_router)
 app.include_router(knowledge_bases_router)
 app.include_router(documents_router)
+app.include_router(events_router)
 
 if settings.MODE == "local":
     from routes.local_upload import router as local_upload_router
@@ -246,9 +272,11 @@ else:
     from routes.graph import router as graph_router
     from routes.ws import router as ws_router
     from routes.public import router as public_router
+    from routes.quiz import router as quiz_router
     from infra.tus import router as tus_router
     app.include_router(api_keys_router)
     app.include_router(tus_router)
     app.include_router(graph_router)
     app.include_router(ws_router)
     app.include_router(public_router)
+    app.include_router(quiz_router)

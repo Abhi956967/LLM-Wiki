@@ -2,22 +2,25 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
+import contextlib
 import hashlib
 import mimetypes
 import re
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
-import httpx
+import httpx  # noqa: F401 -- compatibility alias for existing transport tests
 from html_parser import Image
-from infra.safe_fetch import build_pinned_request, parse_public_fetch_url, redirect_location, resolve_public_ip
+from infra.safe_fetch import fetch_public_image
 
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 IMAGE_TIMEOUT = 5
 IMAGE_CONCURRENCY = 6
 IMAGE_TOTAL_BUDGET = 6
 MAX_IMAGE_REDIRECTS = 3
-MAX_REMOTE_IMAGES = 50
+MAX_WEBCLIP_IMAGES = 50
+MAX_WEBCLIP_ASSET_BYTES = 25 * 1024 * 1024
 
 SAFE_MIME_EXT = {
     "image/jpeg": "jpg",
@@ -64,6 +67,102 @@ class WebclipAsset:
         }
 
 
+@dataclass
+class _ByteReservation:
+    capacity: int
+    active: bool = True
+
+
+@dataclass
+class _ImageSource:
+    index: int
+    image: Image
+    refs: list[str]
+
+
+class _AssetByteBudget:
+    """Track retained payloads and worst-case bytes for active fetches."""
+
+    def __init__(self, limit: int) -> None:
+        self._limit = max(0, limit)
+        self._retained = 0
+        self._reserved = 0
+        self._condition = asyncio.Condition()
+
+    async def reserve(self, requested: int) -> _ByteReservation | None:
+        requested = min(max(0, requested), self._limit)
+        if requested == 0:
+            return None
+
+        async with self._condition:
+            while True:
+                available = self._limit - self._retained - self._reserved
+                if available >= requested:
+                    self._reserved += requested
+                    return _ByteReservation(requested)
+
+                # Active fetches may return fewer bytes than they reserved.
+                # Wait for those reservations to settle before reducing the
+                # next fetch's size limit based on remaining capacity.
+                if self._reserved:
+                    await self._condition.wait()
+                    continue
+
+                if available <= 0:
+                    return None
+                self._reserved += available
+                return _ByteReservation(available)
+
+    async def retain(self, reservation: _ByteReservation, size: int) -> bool:
+        if size < 0 or size > reservation.capacity:
+            await self.release(reservation)
+            return False
+        async with self._condition:
+            if not reservation.active:
+                return False
+            self._reserved -= reservation.capacity
+            self._retained += size
+            reservation.active = False
+            self._condition.notify_all()
+        return True
+
+    async def release(self, reservation: _ByteReservation) -> None:
+        async with self._condition:
+            if not reservation.active:
+                return
+            self._reserved -= reservation.capacity
+            reservation.active = False
+            self._condition.notify_all()
+
+
+def _bounded_unique_sources(images: list[Image]) -> list[_ImageSource]:
+    """Select unique effective sources and collect their reference aliases."""
+
+    selected: list[_ImageSource] = []
+    selected_by_url: dict[str, _ImageSource] = {}
+    seen_refs: set[str] = set()
+    limit = max(0, MAX_WEBCLIP_IMAGES)
+    if limit == 0:
+        return selected
+
+    for index, image in enumerate(images, start=1):
+        if not image.ref or image.ref in seen_refs:
+            continue
+        seen_refs.add(image.ref)
+
+        source = selected_by_url.get(image.url)
+        if source is not None:
+            source.refs.append(image.ref)
+            continue
+        if len(selected) >= limit:
+            continue
+
+        source = _ImageSource(index=index, image=image, refs=[image.ref])
+        selected.append(source)
+        selected_by_url[image.url] = source
+    return selected
+
+
 async def materialize_webclip_assets(
     markdown: str,
     images: list[Image],
@@ -72,53 +171,59 @@ async def materialize_webclip_assets(
     if not images:
         return markdown, []
 
+    selected_sources = _bounded_unique_sources(images)
     sem = asyncio.Semaphore(IMAGE_CONCURRENCY)
+    byte_budget = _AssetByteBudget(MAX_WEBCLIP_ASSET_BYTES)
     assets_by_ref: dict[str, WebclipAsset] = {}
-    remote_allowed = {
-        image.ref
-        for image in [i for i in images if i.ref and _is_remote_url(i.url)][:MAX_REMOTE_IMAGES]
-    }
 
-    async def fetch_one(index: int, image: Image) -> None:
-        if not image.ref:
-            return
-        if _is_remote_url(image.url) and image.ref not in remote_allowed:
-            return
-
-        fetched: tuple[bytes, str, str] | None = None
+    async def fetch_one(source: _ImageSource) -> None:
+        index = source.index
+        image = source.image
         async with sem:
-            result = await _fetch_image(image.url)
-        if result:
-            fetched = (result[0], result[1], image.url)
-        if not fetched:
-            return
+            reservation = await byte_budget.reserve(MAX_IMAGE_BYTES)
+            if reservation is None:
+                return
 
-        data, content_type, fetched_url = fetched
-        ext = SAFE_MIME_EXT.get(content_type) or _guess_extension(fetched_url) or "bin"
-        filename = f"image-{index:02d}.{ext}"
-        src = f"{asset_dir_name}/{filename}"
-        inferred_width, inferred_height = _infer_dimensions_from_url(fetched_url)
-        assets_by_ref[image.ref] = WebclipAsset(
-            filename=filename,
-            src=src,
-            data=data,
-            content_type=content_type,
-            file_type=ext,
-            original_url=fetched_url,
-            alt=image.alt,
-            sha256=hashlib.sha256(data).hexdigest(),
-            index=index,
-            width=image.width or inferred_width,
-            height=image.height or inferred_height,
-        )
+            try:
+                result = await _fetch_image(image.url, reservation.capacity)
+                if not result:
+                    return
 
-    try:
+                data, content_type = result
+                if len(data) > reservation.capacity:
+                    return
+
+                fetched_url = image.url
+                ext = SAFE_MIME_EXT.get(content_type) or _guess_extension(fetched_url) or "bin"
+                filename = f"image-{index:02d}.{ext}"
+                src = f"{asset_dir_name}/{filename}"
+                inferred_width, inferred_height = _infer_dimensions_from_url(fetched_url)
+                asset = WebclipAsset(
+                    filename=filename,
+                    src=src,
+                    data=data,
+                    content_type=content_type,
+                    file_type=ext,
+                    original_url=fetched_url,
+                    alt=image.alt,
+                    sha256=hashlib.sha256(data).hexdigest(),
+                    index=index,
+                    width=image.width or inferred_width,
+                    height=image.height or inferred_height,
+                )
+                if not await byte_budget.retain(reservation, len(data)):
+                    return
+                for ref in source.refs:
+                    assets_by_ref[ref] = asset
+            finally:
+                await byte_budget.release(reservation)
+
+    # Keep whatever materialized within budget; drop the rest on timeout.
+    with contextlib.suppress(TimeoutError):
         await asyncio.wait_for(
-            asyncio.gather(*(fetch_one(i, image) for i, image in enumerate(images, start=1))),
+            asyncio.gather(*(fetch_one(source) for source in selected_sources)),
             timeout=IMAGE_TOTAL_BUDGET,
         )
-    except TimeoutError:
-        pass  # keep whatever materialized within budget; drop the rest
 
     for image in sorted(images, key=lambda img: len(img.ref or ""), reverse=True):
         token = f"llmwiki-image://{image.ref}"
@@ -128,7 +233,11 @@ async def materialize_webclip_assets(
         else:
             markdown = _remove_markdown_image_ref(markdown, token)
 
-    assets = [assets_by_ref[image.ref] for image in images if image.ref in assets_by_ref]
+    assets = [
+        assets_by_ref[source.refs[0]]
+        for source in selected_sources
+        if source.refs[0] in assets_by_ref
+    ]
     return markdown, assets
 
 
@@ -143,66 +252,32 @@ def _is_remote_url(url: str) -> bool:
     return url.startswith(("http://", "https://"))
 
 
-async def _fetch_image(url: str) -> tuple[bytes, str] | None:
+async def _fetch_image(url: str, max_bytes: int | None = None) -> tuple[bytes, str] | None:
+    max_bytes = MAX_IMAGE_BYTES if max_bytes is None else min(max_bytes, MAX_IMAGE_BYTES)
+    if max_bytes <= 0:
+        return None
     if url.startswith("data:"):
-        return _decode_data_image(url)
+        return _decode_data_image(url, max_bytes)
     if _is_remote_url(url):
-        return await _fetch_remote_image(url)
+        return await _fetch_remote_image(url, max_bytes)
     return None
 
 
-async def _fetch_remote_image(url: str) -> tuple[bytes, str] | None:
+async def _fetch_remote_image(url: str, max_bytes: int | None = None) -> tuple[bytes, str] | None:
     """Fetch an external image with SSRF guards and size/type validation, or None."""
-    current = url
-    async with httpx.AsyncClient(timeout=IMAGE_TIMEOUT, follow_redirects=False, trust_env=False) as client:
-        for _ in range(MAX_IMAGE_REDIRECTS + 1):
-            parsed = parse_public_fetch_url(current)
-            if not parsed:
-                return None
-            ip = resolve_public_ip(parsed.hostname)
-            if not ip:
-                return None
-            request = build_pinned_request(client, parsed, ip, {"Accept": "image/*"})
-            try:
-                resp = await client.send(request, stream=True)
-            except (httpx.HTTPError, ValueError):
-                return None
-            try:
-                redirect = redirect_location(resp, current)
-                if redirect:
-                    current = redirect
-                    continue
-                return await _read_image_response(resp)
-            finally:
-                await resp.aclose()
-    return None
+    max_bytes = MAX_IMAGE_BYTES if max_bytes is None else min(max_bytes, MAX_IMAGE_BYTES)
+    return await fetch_public_image(
+        url,
+        max_bytes=max_bytes,
+        timeout=IMAGE_TIMEOUT,
+        max_redirects=MAX_IMAGE_REDIRECTS,
+    )
 
 
-async def _read_image_response(resp: httpx.Response) -> tuple[bytes, str] | None:
-    if resp.status_code != 200:
+def _decode_data_image(url: str, max_bytes: int | None = None) -> tuple[bytes, str] | None:
+    max_bytes = MAX_IMAGE_BYTES if max_bytes is None else min(max_bytes, MAX_IMAGE_BYTES)
+    if max_bytes <= 0:
         return None
-
-    content_length = resp.headers.get("content-length")
-    if content_length and content_length.isdigit() and int(content_length) > MAX_IMAGE_BYTES:
-        return None
-
-    chunks = bytearray()
-    async for chunk in resp.aiter_bytes():
-        chunks.extend(chunk)
-        if len(chunks) > MAX_IMAGE_BYTES:
-            return None
-    data = bytes(chunks)
-
-    sniffed = _sniff_image_type(data)
-    content_type = _clean_content_type(resp.headers.get("content-type", ""))
-    if content_type not in SAFE_MIME_EXT:
-        content_type = sniffed or ""
-    if content_type not in SAFE_MIME_EXT or sniffed != content_type:
-        return None
-    return data, content_type
-
-
-def _decode_data_image(url: str) -> tuple[bytes, str] | None:
     match = re.match(r"^data:([^;,]+)(;base64)?,(.*)$", url, flags=re.IGNORECASE | re.DOTALL)
     if not match:
         return None
@@ -211,10 +286,20 @@ def _decode_data_image(url: str) -> tuple[bytes, str] | None:
         return None
     try:
         payload = match.group(3)
-        data = base64.b64decode(payload, validate=True) if match.group(2) else payload.encode("utf-8")
-    except Exception:
+        if match.group(2):
+            if len(payload) % 4:
+                return None
+            decoded_size = (len(payload) // 4) * 3 - (len(payload) - len(payload.rstrip("=")))
+            if decoded_size > max_bytes:
+                return None
+            data = base64.b64decode(payload, validate=True)
+        else:
+            if not payload.isascii() or len(payload) > max_bytes:
+                return None
+            data = payload.encode("ascii")
+    except (binascii.Error, ValueError):
         return None
-    if len(data) > MAX_IMAGE_BYTES:
+    if len(data) > max_bytes:
         return None
     if _sniff_image_type(data) != content_type:
         return None

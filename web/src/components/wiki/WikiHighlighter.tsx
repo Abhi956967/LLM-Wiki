@@ -1,12 +1,12 @@
 'use client'
 
 import * as React from 'react'
-import { Highlighter, Loader2, MessageSquarePlus, Pencil, Trash2 } from 'lucide-react'
+import { Copy, Highlighter, MessageSquarePlus, Trash2, X } from 'lucide-react'
 import { toast } from 'sonner'
 
 import { Button } from '@/components/ui/button'
+import { Kbd } from '@/components/ui/kbd'
 import { Textarea } from '@/components/ui/textarea'
-import { cn } from '@/lib/utils'
 import {
   domPlaintextFromContainer,
   offsetAtDomPoint,
@@ -14,9 +14,10 @@ import {
   rangeFromOffsets,
   type DomPlaintext,
 } from '@/lib/highlights/domPlaintext'
-import { locateTextAnchor, normalizeAnchorText } from '@/lib/highlights/locator'
-import { useWikiHighlights } from '@/hooks/useWikiHighlights'
-import type { Highlight as HighlightModel, TextAnchor } from '@/lib/highlights/types'
+import { resolveHighlightOffsets } from '@/lib/highlights/resolveHighlightOffsets'
+import { ReplyThread } from './ReplyThread'
+import type { WikiHighlightsApi } from '@/hooks/useWikiHighlights'
+import type { HighlightReply, TextAnchor } from '@/lib/highlights/types'
 
 const CONTEXT_CHARS = 80
 const MAX_HIGHLIGHT_CHARS = 10000
@@ -29,11 +30,30 @@ interface CardPosition {
   left: number
 }
 
+type PendingSelection = CardPosition & { anchor: TextAnchor }
+
+type ActiveCard = CardPosition & {
+  comment: string | null
+  replies: HighlightReply[]
+} & (
+    | { mode: 'create'; anchor: TextAnchor }
+    | { mode: 'edit'; id: string }
+  )
+
 interface ResolvedHighlight {
   id: string
   start: number
   end: number
   comment: string | null
+  replies: HighlightReply[]
+}
+
+function ComposerHint() {
+  return (
+    <span className="text-[11px] text-muted-foreground/60">
+      <Kbd>↵</Kbd> save · <Kbd>⇧↵</Kbd> line · <Kbd>esc</Kbd> dismiss
+    </span>
+  )
 }
 
 interface Props {
@@ -41,20 +61,21 @@ interface Props {
   contentRef: React.RefObject<HTMLDivElement | null>
   documentId: string
   contentKey: string
+  api: WikiHighlightsApi
 }
 
-export function WikiHighlighter({ scrollRef, contentRef, documentId, contentKey }: Props) {
-  const { highlights, saveHighlight, updateComment, removeHighlight } = useWikiHighlights(documentId)
-  const [toolbar, setToolbar] = React.useState<(CardPosition & { anchor: TextAnchor }) | null>(null)
-  const [composer, setComposer] = React.useState<(CardPosition & { anchor: TextAnchor }) | null>(null)
-  const [active, setActive] = React.useState<(CardPosition & { id: string; comment: string | null }) | null>(null)
-  const [editing, setEditing] = React.useState(false)
+export function WikiHighlighter({ scrollRef, contentRef, documentId, contentKey, api }: Props) {
+  const { highlights, saveHighlight, updateComment, removeHighlight } = api
+  // Text selection is transient. Persistence starts only when the user chooses
+  // Highlight or saves a Note from the selection toolbar.
+  const [pending, setPending] = React.useState<PendingSelection | null>(null)
+  const [active, setActive] = React.useState<ActiveCard | null>(null)
   const [draft, setDraft] = React.useState('')
-  const [saving, setSaving] = React.useState(false)
-  const [peek, setPeek] = React.useState<(CardPosition & { comment: string }) | null>(null)
+  const [peek, setPeek] = React.useState<(CardPosition & { comment: string | null; replies: HighlightReply[] }) | null>(null)
   const resolvedRef = React.useRef<ResolvedHighlight[]>([])
   const dpRef = React.useRef<DomPlaintext | null>(null)
   const peekIdRef = React.useRef<string | null>(null)
+  const lastAnchorRef = React.useRef<TextAnchor | null>(null)
 
   const supportsPainting = typeof CSS !== 'undefined' && 'highlights' in CSS
 
@@ -85,12 +106,13 @@ export function WikiHighlighter({ scrollRef, contentRef, documentId, contentKey 
     const noteRanges: Range[] = []
     for (const h of highlights) {
       if (h.type === 'pdf') continue
-      const offsets = resolveOffsets(h, dp)
+      const offsets = resolveHighlightOffsets(h, dp)
       if (!offsets) continue
       const range = rangeFromOffsets(dp, offsets.start, offsets.end)
       if (!range) continue
-      resolved.push({ id: h.id, start: offsets.start, end: offsets.end, comment: h.comment })
-      if (h.comment) noteRanges.push(range)
+      const replies = h.replies ?? []
+      resolved.push({ id: h.id, start: offsets.start, end: offsets.end, comment: h.comment, replies })
+      if (h.comment || replies.length > 0) noteRanges.push(range)
       else plainRanges.push(range)
     }
     resolvedRef.current = resolved
@@ -127,12 +149,11 @@ export function WikiHighlighter({ scrollRef, contentRef, documentId, contentKey 
 
   // Close any open card when navigating to another page.
   React.useEffect(() => {
-    setToolbar(null)
-    setComposer(null)
+    setPending(null)
     setActive(null)
-    setEditing(false)
     setDraft('')
     peekIdRef.current = null
+    lastAnchorRef.current = null
     setPeek(null)
   }, [contentKey, documentId])
 
@@ -156,29 +177,39 @@ export function WikiHighlighter({ scrollRef, contentRef, documentId, contentKey 
     [scrollRef],
   )
 
-  // rAF-debounced: selectionchange fires on every drag tick, and reading the
-  // anchor walks the page's text nodes each time.
+  // Mutations paint optimistically in useWikiHighlights, so the overlays close
+  // immediately and failures roll back + toast from the background.
+  const persist = React.useCallback((action: () => Promise<void>, failure: string): void => {
+    action().catch((err: unknown) => {
+      toast.error(err instanceof Error ? err.message : failure)
+    })
+  }, [])
+
+  // Releasing a selection only opens the action toolbar. The selection stays
+  // native so Cmd/Ctrl+C works without leaving a persisted highlight.
   React.useEffect(() => {
-    let raf = 0
-    const handleSelectionChange = () => {
-      cancelAnimationFrame(raf)
-      raf = requestAnimationFrame(() => {
+    const container = scrollRef.current
+    if (!container) return
+    const handlePointerUp = (event: PointerEvent) => {
+      const target = event.target as HTMLElement
+      if (target.closest('[data-wiki-highlighter]')) return
+      // The selection settles after pointerup (double/triple click included).
+      requestAnimationFrame(() => {
         const selectionAnchor = readSelectionAnchor(contentRef.current)
-        if (!selectionAnchor) {
-          setToolbar(null)
-          return
-        }
+        if (!selectionAnchor) return
+        const { anchor } = selectionAnchor
+        const last = lastAnchorRef.current
+        if (last && last.textStart === anchor.textStart && last.textEnd === anchor.textEnd) return
         const position = localPosition(selectionAnchor.rect)
         if (!position) return
-        setToolbar({ ...position, anchor: selectionAnchor.anchor })
+        lastAnchorRef.current = anchor
+        setActive(null)
+        setPending({ ...position, anchor })
       })
     }
-    document.addEventListener('selectionchange', handleSelectionChange)
-    return () => {
-      cancelAnimationFrame(raf)
-      document.removeEventListener('selectionchange', handleSelectionChange)
-    }
-  }, [contentRef, localPosition])
+    container.addEventListener('pointerup', handlePointerUp)
+    return () => container.removeEventListener('pointerup', handlePointerUp)
+  }, [contentRef, localPosition, scrollRef])
 
   // Click on painted text opens the comment card for that highlight.
   React.useEffect(() => {
@@ -190,26 +221,26 @@ export function WikiHighlighter({ scrollRef, contentRef, documentId, contentKey 
       if (target.closest('a, button')) return
       const selection = window.getSelection()
       if (selection && !selection.isCollapsed) return
+      lastAnchorRef.current = null
       const content = contentRef.current
       if (!content || !content.contains(target)) {
+        setPending(null)
         setActive(null)
-        setEditing(false)
         return
       }
       const hit = hitTestHighlight(freshPlaintext(content), event, resolvedRef.current)
       if (!hit) {
+        setPending(null)
         setActive(null)
-        setEditing(false)
         return
       }
       const position = localPosition(new DOMRect(event.clientX, event.clientY, 0, 0))
       if (!position) return
-      setToolbar(null)
-      setEditing(false)
+      setPending(null)
       setDraft(hit.comment ?? '')
       peekIdRef.current = null
       setPeek(null)
-      setActive({ ...position, id: hit.id, comment: hit.comment })
+      setActive({ ...position, mode: 'edit', id: hit.id, comment: hit.comment, replies: hit.replies })
     }
     container.addEventListener('click', handleClick)
     return () => container.removeEventListener('click', handleClick)
@@ -229,7 +260,7 @@ export function WikiHighlighter({ scrollRef, contentRef, documentId, contentKey 
     const handleMove = (event: MouseEvent) => {
       cancelAnimationFrame(raf)
       raf = requestAnimationFrame(() => {
-        if (toolbar || composer || active) {
+        if (pending || active) {
           clearPeek()
           return
         }
@@ -239,7 +270,7 @@ export function WikiHighlighter({ scrollRef, contentRef, documentId, contentKey 
           return
         }
         const hit = hitTestHighlight(freshPlaintext(content), event, resolvedRef.current)
-        if (!hit?.comment) {
+        if (!hit || (!hit.comment && hit.replies.length === 0)) {
           clearPeek()
           return
         }
@@ -247,7 +278,7 @@ export function WikiHighlighter({ scrollRef, contentRef, documentId, contentKey 
         const position = localPosition(new DOMRect(event.clientX, event.clientY, 0, 0))
         if (!position) return
         peekIdRef.current = hit.id
-        setPeek({ ...position, comment: hit.comment })
+        setPeek({ ...position, comment: hit.comment, replies: hit.replies })
       })
     }
     container.addEventListener('mousemove', handleMove)
@@ -257,147 +288,152 @@ export function WikiHighlighter({ scrollRef, contentRef, documentId, contentKey 
       container.removeEventListener('mousemove', handleMove)
       container.removeEventListener('mouseleave', clearPeek)
     }
-  }, [active, composer, contentRef, freshPlaintext, localPosition, scrollRef, toolbar])
+  }, [active, contentRef, pending, freshPlaintext, localPosition, scrollRef])
+
+  const clearPending = React.useCallback(() => {
+    window.getSelection()?.removeAllRanges()
+    lastAnchorRef.current = null
+    setPending(null)
+  }, [])
+
+  const handlePendingHighlight = React.useCallback(() => {
+    if (!pending) return
+    const { anchor } = pending
+    clearPending()
+    persist(() => saveHighlight(anchor, null), 'Failed to save highlight')
+  }, [clearPending, pending, persist, saveHighlight])
+
+  const handlePendingNote = React.useCallback(() => {
+    if (!pending) return
+    const { anchor, top, bottom, left } = pending
+    clearPending()
+    setDraft('')
+    setActive({ top, bottom, left, mode: 'create', anchor, comment: null, replies: [] })
+  }, [clearPending, pending])
+
+  const handlePendingCopy = React.useCallback(async () => {
+    if (!pending) return
+    try {
+      await copyText(pending.anchor.textContent)
+      clearPending()
+      toast.success('Copied')
+    } catch {
+      toast.error('Could not copy selection')
+    }
+  }, [clearPending, pending])
 
   React.useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return
-      setToolbar(null)
-      setComposer(null)
-      setActive(null)
-      setEditing(false)
+      if (event.key === 'Escape') {
+        clearPending()
+        setActive(null)
+        return
+      }
+
+      const target = event.target
+      if (target instanceof Element && target.closest('input, textarea, [contenteditable]')) return
+      if (!pending || event.metaKey || event.ctrlKey || event.altKey) return
+      if (event.key.toLowerCase() === 'h') {
+        event.preventDefault()
+        handlePendingHighlight()
+      } else if (event.key.toLowerCase() === 'n') {
+        event.preventDefault()
+        handlePendingNote()
+      }
     }
     document.addEventListener('keydown', handleKeyDown)
     return () => document.removeEventListener('keydown', handleKeyDown)
-  }, [])
+  }, [clearPending, handlePendingHighlight, handlePendingNote, pending])
 
-  const runSave = React.useCallback(
-    async (action: () => Promise<void>, failure: string): Promise<boolean> => {
-      setSaving(true)
-      try {
-        await action()
-        return true
-      } catch (err) {
-        toast.error(err instanceof Error ? err.message : failure)
-        return false
-      } finally {
-        setSaving(false)
-      }
+  const handleCommentSave = React.useCallback(() => {
+    if (!active) return
+    setActive(null)
+    if (active.mode === 'create') {
+      persist(() => saveHighlight(active.anchor, draft), 'Failed to save note')
+    } else {
+      persist(() => updateComment(active.id, draft), 'Failed to save note')
+    }
+  }, [active, draft, persist, saveHighlight, updateComment])
+
+  const saveOnEnter = React.useCallback(
+    (save: () => void) => (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      if (event.key !== 'Enter' || event.shiftKey) return
+      event.preventDefault()
+      save()
     },
     [],
   )
 
-  const handleHighlight = React.useCallback(async () => {
-    if (!toolbar) return
-    const ok = await runSave(() => saveHighlight(toolbar.anchor, null), 'Failed to save highlight')
-    if (!ok) return
-    window.getSelection()?.removeAllRanges()
-    setToolbar(null)
-  }, [runSave, saveHighlight, toolbar])
-
-  const handleOpenComposer = React.useCallback(() => {
-    if (!toolbar) return
-    setDraft('')
-    setComposer(toolbar)
-    setToolbar(null)
-    window.getSelection()?.removeAllRanges()
-  }, [toolbar])
-
-  const handleComposerSave = React.useCallback(async () => {
-    if (!composer) return
-    const ok = await runSave(() => saveHighlight(composer.anchor, draft), 'Failed to save note')
-    if (!ok) return
-    setComposer(null)
-    setDraft('')
-  }, [composer, draft, runSave, saveHighlight])
-
-  const handleCommentSave = React.useCallback(async () => {
-    if (!active) return
-    const ok = await runSave(() => updateComment(active.id, draft), 'Failed to save note')
-    if (!ok) return
-    setActive({ ...active, comment: draft.trim() || null })
-    setEditing(false)
-  }, [active, draft, runSave, updateComment])
-
-  const handleDelete = React.useCallback(async () => {
-    if (!active) return
-    const ok = await runSave(() => removeHighlight(active.id), 'Failed to remove highlight')
-    if (!ok) return
+  const handleDelete = React.useCallback(() => {
+    if (!active || active.mode !== 'edit') return
     setActive(null)
-    setEditing(false)
-  }, [active, removeHighlight, runSave])
+    persist(() => removeHighlight(active.id), 'Failed to remove highlight')
+  }, [active, persist, removeHighlight])
+
+  const handleCommentCancel = React.useCallback(() => {
+    setActive(null)
+    setDraft('')
+  }, [])
 
   return (
     <>
       {peek && (
         <div
           data-wiki-highlighter
-          className="pointer-events-none absolute z-20 w-max max-w-[26rem] -translate-x-1/2 whitespace-pre-wrap rounded-md border border-border bg-popover px-3 py-2 text-[13px] leading-relaxed text-popover-foreground shadow-md"
+          className="pointer-events-none absolute z-20 w-max max-w-[26rem] -translate-x-1/2"
           style={{ top: peek.bottom + 10, left: peek.left }}
         >
-          {peek.comment}
+          <div className="animate-in fade-in-0 duration-100 rounded-md border border-border bg-popover px-3 py-2 shadow-md">
+            {peek.comment && (
+              <p className="whitespace-pre-wrap text-[13px] leading-relaxed text-popover-foreground">
+                {peek.comment}
+              </p>
+            )}
+            <ReplyThread replies={peek.replies} />
+          </div>
         </div>
       )}
 
-      {toolbar && !composer && (
+      {pending && (
         <div
           data-wiki-highlighter
-          className="absolute z-30 flex -translate-x-1/2 -translate-y-full items-center gap-0.5 rounded-md border border-border bg-popover p-0.5 shadow-md"
-          style={{ top: toolbar.top - 8, left: toolbar.left }}
+          className="absolute z-30 -translate-x-1/2 -translate-y-full"
+          style={{ top: pending.top - 8, left: pending.left }}
           onMouseDown={(event) => event.preventDefault()}
         >
-          <Button
-            variant="ghost"
-            size="icon"
-            className="size-7"
-            title="Highlight"
-            disabled={saving}
-            onClick={handleHighlight}
-          >
-            {saving ? <Loader2 className="size-3.5 animate-spin" /> : <Highlighter className="size-3.5" />}
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="size-7"
-            title="Highlight with note"
-            disabled={saving}
-            onClick={handleOpenComposer}
-          >
-            <MessageSquarePlus className="size-3.5" />
-          </Button>
-        </div>
-      )}
-
-      {composer && (
-        <div
-          data-wiki-highlighter
-          className="absolute z-30 w-[26rem] -translate-x-1/2 rounded-md border border-border bg-popover p-3 shadow-md"
-          style={{ top: composer.bottom + 8, left: composer.left }}
-        >
-          <Textarea
-            value={draft}
-            onChange={(event) => setDraft(event.target.value)}
-            placeholder="What's unclear here?"
-            rows={5}
-            maxLength={4000}
-            className="max-h-72 min-h-28 resize-y text-sm"
-            autoFocus
-          />
-          <div className="mt-2.5 flex justify-end gap-2">
+          <div className="animate-in fade-in-0 zoom-in-95 duration-100 flex items-center gap-0.5 rounded-md border border-border bg-popover p-0.5 shadow-md">
             <Button
               variant="ghost"
-              size="sm"
-              onClick={() => {
-                setComposer(null)
-                setDraft('')
-              }}
+              size="icon"
+              className="size-7"
+              title="Highlight (H)"
+              aria-label="Highlight selected text"
+              aria-keyshortcuts="H"
+              onClick={handlePendingHighlight}
             >
-              Cancel
+              <Highlighter className="size-3.5" />
             </Button>
-            <Button size="sm" disabled={saving} onClick={handleComposerSave}>
-              {saving && <Loader2 className="size-3 animate-spin" />}
-              Save
+            <Button
+              variant="ghost"
+              size="icon"
+              className="size-7"
+              title="Add note (N)"
+              aria-label="Add note to selected text"
+              aria-keyshortcuts="N"
+              onClick={handlePendingNote}
+            >
+              <MessageSquarePlus className="size-3.5" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="size-7"
+              title="Copy (Cmd/Ctrl+C)"
+              aria-label="Copy selected text"
+              aria-keyshortcuts="Meta+C Control+C"
+              onClick={() => void handlePendingCopy()}
+            >
+              <Copy className="size-3.5" />
             </Button>
           </div>
         </div>
@@ -406,89 +442,72 @@ export function WikiHighlighter({ scrollRef, contentRef, documentId, contentKey 
       {active && (
         <div
           data-wiki-highlighter
-          className="absolute z-30 w-[26rem] -translate-x-1/2 rounded-md border border-border bg-popover p-3 shadow-md"
+          className="absolute z-30 w-[26rem] -translate-x-1/2"
           style={{ top: active.bottom + 12, left: active.left }}
         >
-          {editing ? (
-            <>
-              <Textarea
-                value={draft}
-                onChange={(event) => setDraft(event.target.value)}
-                placeholder="What's unclear here?"
-                rows={5}
-                maxLength={4000}
-                className="max-h-72 min-h-28 resize-y text-sm"
-                autoFocus
-              />
-              <div className="mt-2.5 flex justify-end gap-2">
-                <Button variant="ghost" size="sm" onClick={() => setEditing(false)}>
-                  Cancel
-                </Button>
-                <Button size="sm" disabled={saving} onClick={handleCommentSave}>
-                  {saving && <Loader2 className="size-3 animate-spin" />}
-                  Save
-                </Button>
+          <div className="animate-in fade-in-0 zoom-in-95 slide-in-from-top-1 duration-150 rounded-md border border-border bg-popover p-3 shadow-md">
+            {active.replies.length > 0 && (
+              <div className="mb-2.5 max-h-40 overflow-y-auto">
+                <ReplyThread replies={active.replies} />
               </div>
-            </>
-          ) : (
-            <div className="flex items-start gap-2">
-              <p
-                className={cn(
-                  'flex-1 min-w-0 text-sm leading-relaxed whitespace-pre-wrap',
-                  active.comment ? 'text-foreground' : 'italic text-muted-foreground',
-                )}
-              >
-                {active.comment ?? 'No note'}
-              </p>
-              <div className="flex shrink-0 gap-0.5">
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="size-7"
-                  title={active.comment ? 'Edit note' : 'Add note'}
-                  onClick={() => {
-                    setDraft(active.comment ?? '')
-                    setEditing(true)
-                  }}
-                >
-                  <Pencil className="size-3.5" />
-                </Button>
+            )}
+            <Textarea
+              value={draft}
+              onChange={(event) => setDraft(event.target.value)}
+              onKeyDown={saveOnEnter(handleCommentSave)}
+              onFocus={(event) => {
+                const el = event.currentTarget
+                el.setSelectionRange(el.value.length, el.value.length)
+              }}
+              placeholder="What's unclear here?"
+              rows={5}
+              maxLength={4000}
+              className="max-h-72 min-h-28 resize-y text-sm"
+              autoFocus
+            />
+            <div className="mt-2 flex items-center justify-between">
+              {active.mode === 'edit' ? (
                 <Button
                   variant="ghost"
                   size="icon"
                   className="size-7 text-muted-foreground hover:text-destructive"
                   title="Remove highlight"
-                  disabled={saving}
+                  aria-label="Remove highlight"
                   onClick={handleDelete}
                 >
-                  {saving ? <Loader2 className="size-3.5 animate-spin" /> : <Trash2 className="size-3.5" />}
+                  <Trash2 className="size-3.5" />
                 </Button>
-              </div>
+              ) : (
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="size-7 text-muted-foreground"
+                  title="Cancel note"
+                  aria-label="Cancel note"
+                  onClick={handleCommentCancel}
+                >
+                  <X className="size-3.5" />
+                </Button>
+              )}
+              <ComposerHint />
             </div>
-          )}
+          </div>
         </div>
       )}
     </>
   )
 }
 
-function resolveOffsets(h: HighlightModel, dp: DomPlaintext): { start: number; end: number } | null {
-  if (h.textAnchor) {
-    const ta = h.textAnchor
-    const slice = dp.text.slice(ta.textStart, ta.textEnd)
-    if (slice.length > 0 && normalizeAnchorText(slice) === normalizeAnchorText(ta.textContent)) {
-      return { start: ta.textStart, end: ta.textEnd }
+async function copyText(text: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text)
+      return
+    } catch {
+      // Fall back to the browser's selection-based copy path.
     }
   }
-  const search = h.textAnchor ?? h.anchor
-  if (!search) return null
-  const located = locateTextAnchor(dp.text, {
-    textContent: search.textContent,
-    prefix: search.prefix,
-    suffix: search.suffix,
-  })
-  if (!located) return null
-  return { start: located.textStart, end: located.textEnd }
+  if (!document.execCommand('copy')) throw new Error('Clipboard unavailable')
 }
 
 function readSelectionAnchor(

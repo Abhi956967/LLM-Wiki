@@ -2,17 +2,29 @@
 
 import * as React from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
-import { ArrowUpRight, BookOpen, Loader2, Upload as UploadIcon } from 'lucide-react'
+import { ArrowUpRight, BookOpen, Loader2, PlugZap, Upload as UploadIcon } from 'lucide-react'
+import { toast } from 'sonner'
+import { Button } from '@/components/ui/button'
+import {
+  Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
+} from '@/components/ui/dialog'
 import { KBSidenav } from '@/components/kb/KBSidenav'
+import { PlanProgress } from '@/components/kb/PlanProgress'
+import { RecentChanges } from '@/components/kb/RecentChanges'
+import { openMcpConnectionDock } from '@/components/connections/McpConnectionDock'
 import { WikiContent } from '@/components/wiki/WikiContent'
 import { useKBDocuments } from '@/hooks/useKBDocuments'
 import { apiFetch } from '@/lib/api'
 import { useUserStore } from '@/stores'
 import type { DocumentListItem, WikiNode } from '@/lib/types'
 import {
-  enrichTreeWithProgress, findCurrentLesson, flattenLessons, lessonStatus,
+  enrichTreeWithProgress, findCurrentLesson, flattenLessons, flattenPages, lessonStatus,
 } from '@/lib/wikiTree'
+import { isOwnWrite } from '@/lib/highlights/ownWrites'
+import { parsePlanTasks, type PlanSummary } from '@/lib/planTasks'
 import { useCourseProgress } from '@/hooks/useCourseProgress'
+
+const isLocal = process.env.NEXT_PUBLIC_MODE === 'local'
 
 function buildTreeFromDocs(docs: DocumentListItem[]): WikiNode[] {
   const sorted = [...docs].sort((a, b) => (a.sort_order ?? 999) - (b.sort_order ?? 999))
@@ -68,6 +80,8 @@ function buildTreeFromDocs(docs: DocumentListItem[]): WikiNode[] {
     const sa = slug(a), sb = slug(b)
     if (sa === 'overview') return -1
     if (sb === 'overview') return 1
+    if (sa === 'plan') return -1
+    if (sb === 'plan') return 1
     if (sa === 'log') return 1
     if (sb === 'log') return -1
     return a.title.localeCompare(b.title)
@@ -90,6 +104,21 @@ function enrichTreeWithDocNumbers(tree: WikiNode[], docs: DocumentListItem[]): W
     }))
   }
   return enrich(tree)
+}
+
+// index.json keeps listing pages after they're deleted (the agent syncs it
+// lazily); drop tree entries whose document no longer exists.
+function pruneMissingPages(nodes: WikiNode[], existing: Set<string>): WikiNode[] {
+  const pruned: WikiNode[] = []
+  for (const node of nodes) {
+    const children = node.children ? pruneMissingPages(node.children, existing) : undefined
+    if (node.path && !existing.has(node.path)) {
+      if (children?.length) pruned.push({ ...node, path: undefined, docNumber: null, children })
+      continue
+    }
+    pruned.push({ ...node, children })
+  }
+  return pruned
 }
 
 function findFirstPath(nodes: WikiNode[]): { path: string; docNumber: number | null } | null {
@@ -121,11 +150,14 @@ export function WikiOnlyDetail({
   const courseMode = kbKind === 'course'
   const { markComplete } = useCourseProgress(setDocuments)
 
-  const updateParam = React.useCallback((key: string, value: string | null) => {
+  const updateParam = React.useCallback((key: string, value: string | null, mode: 'push' | 'replace' = 'replace') => {
     const url = new URL(window.location.href)
+    if (url.searchParams.get(key) === value) return
     if (value != null) url.searchParams.set(key, value)
     else url.searchParams.delete(key)
-    window.history.replaceState(window.history.state, '', url.pathname + url.search)
+    const next = url.pathname + url.search
+    if (mode === 'push') window.history.pushState(window.history.state, '', next)
+    else window.history.replaceState(window.history.state, '', next)
   }, [])
 
   const wikiDocs = React.useMemo(
@@ -136,11 +168,17 @@ export function WikiOnlyDetail({
     () => documents.filter((d) => !d.path.startsWith('/wiki/') && !d.archived),
     [documents],
   )
+  const wikiPathSet = React.useMemo(() => {
+    const set = new Set<string>()
+    for (const d of wikiDocs) {
+      set.add((d.path + d.filename).replace(/^\/wiki\/?/, ''))
+    }
+    return set
+  }, [wikiDocs])
 
   const pParam = searchParams.get('p')
   const urlWikiDocNumber = pParam ? parseInt(pParam, 10) : null
   const [wikiActivePath, setWikiActivePath] = React.useState<string | null>(null)
-  const lastWikiDocNumberRef = React.useRef<number | null>(urlWikiDocNumber)
   const handledUrlDocNumberRef = React.useRef<number | null>(null)
 
   // Applies ?p= to the active path exactly once per URL value (deep links, back/forward).
@@ -153,11 +191,25 @@ export function WikiOnlyDetail({
     if (urlWikiDocNumber === handledUrlDocNumberRef.current) return
     if (new URL(window.location.href).searchParams.get('p') !== String(urlWikiDocNumber)) return
     const doc = documents.find((d) => d.document_number === urlWikiDocNumber)
-    if (!doc) return
+    if (!doc) {
+      if (!courseMode) {
+        handledUrlDocNumberRef.current = null
+        setWikiActivePath(null)
+        updateParam('p', null)
+      }
+      return
+    }
     handledUrlDocNumberRef.current = urlWikiDocNumber
     setWikiActivePath((doc.path + doc.filename).replace(/^\/wiki\/?/, ''))
-    lastWikiDocNumberRef.current = urlWikiDocNumber
-  }, [urlWikiDocNumber, documents])
+  }, [courseMode, documents, updateParam, urlWikiDocNumber])
+
+  // Browser back/forward can return from a page deep link to the wiki root.
+  React.useEffect(() => {
+    if (courseMode || urlWikiDocNumber != null) return
+    if (new URL(window.location.href).searchParams.has('p')) return
+    handledUrlDocNumberRef.current = null
+    setWikiActivePath(null)
+  }, [courseMode, urlWikiDocNumber])
 
   const indexDoc = wikiDocs.find((d) => d.filename === 'index.json' && d.path === '/wiki/')
   const scaffoldFiles = React.useMemo(() => new Set(['index.json', 'overview.md', 'log.md']), [])
@@ -167,7 +219,13 @@ export function WikiOnlyDetail({
   )
   const [wikiTree, setWikiTree] = React.useState<WikiNode[]>([])
   const [indexLoaded, setIndexLoaded] = React.useState(false)
-  const wikiDocIds = React.useMemo(() => wikiDocs.map((d) => d.id).join(), [wikiDocs])
+  // Fingerprint of every field the tree is built from — `wikiDocs` itself gets
+  // a new identity on any websocket churn (highlight saves bump versions) and
+  // would refetch index.json on every event.
+  const wikiTreeFingerprint = React.useMemo(
+    () => wikiDocs.map((d) => [d.id, d.path, d.filename, d.title, d.document_number, d.sort_order].join(':')).join('|'),
+    [wikiDocs],
+  )
 
   React.useEffect(() => {
     let cancelled = false
@@ -194,18 +252,44 @@ export function WikiOnlyDetail({
       setIndexLoaded(true)
     }
     return () => { cancelled = true }
-  }, [indexDoc?.id, token, wikiDocIds, wikiDocs])
+  }, [indexDoc?.id, indexDoc?.version, token, wikiTreeFingerprint])
+
+  const planDoc = React.useMemo(
+    () => wikiDocs.find((d) => d.path === '/wiki/' && d.filename === 'plan.md') ?? null,
+    [wikiDocs],
+  )
+  const [planSummary, setPlanSummary] = React.useState<PlanSummary | null>(null)
 
   React.useEffect(() => {
-    if (indexLoaded && !wikiActivePath && urlWikiDocNumber == null && wikiTree.length && !loading) {
-      const first = findFirstPath(wikiTree)
+    if (courseMode || !planDoc || !token) {
+      setPlanSummary(null)
+      return
+    }
+    let cancelled = false
+    apiFetch<{ content: string }>(`/v1/documents/${planDoc.id}/content`, token)
+      .then((res) => {
+        if (!cancelled) setPlanSummary(parsePlanTasks(res.content || ''))
+      })
+      .catch(() => {
+        if (!cancelled) setPlanSummary(null)
+      })
+    return () => { cancelled = true }
+  }, [courseMode, planDoc?.id, planDoc?.version, token])
+
+  const prunedTree = React.useMemo(
+    () => (loading ? wikiTree : pruneMissingPages(wikiTree, wikiPathSet)),
+    [loading, wikiTree, wikiPathSet],
+  )
+
+  React.useEffect(() => {
+    if (courseMode && indexLoaded && !wikiActivePath && urlWikiDocNumber == null && prunedTree.length && !loading) {
+      const first = findFirstPath(prunedTree)
       if (first) {
         setWikiActivePath(first.path)
-        lastWikiDocNumberRef.current = first.docNumber
         if (first.docNumber != null) updateParam('p', String(first.docNumber))
       }
     }
-  }, [indexLoaded, wikiTree, wikiActivePath, urlWikiDocNumber, loading, updateParam])
+  }, [courseMode, indexLoaded, prunedTree, wikiActivePath, urlWikiDocNumber, loading, updateParam])
 
   const [pageContent, setPageContent] = React.useState('')
   const [pageTitle, setPageTitle] = React.useState('')
@@ -222,8 +306,8 @@ export function WikiOnlyDetail({
 
   // ─── Course progress (derived from the lessons' metadata.course.status) ─────
   const displayTree = React.useMemo(
-    () => (courseMode ? enrichTreeWithProgress(wikiTree, wikiDocs) : wikiTree),
-    [courseMode, wikiTree, wikiDocs],
+    () => (courseMode ? enrichTreeWithProgress(prunedTree, wikiDocs) : prunedTree),
+    [courseMode, prunedTree, wikiDocs],
   )
   const lessons = React.useMemo(() => (courseMode ? flattenLessons(displayTree) : []), [courseMode, displayTree])
   const completedCount = React.useMemo(() => lessons.filter((l) => l.status === 'complete').length, [lessons])
@@ -270,6 +354,17 @@ export function WikiOnlyDetail({
     return target?.path ? { title: target.title, path: target.path } : null
   }, [courseMode, displayTree, lessons])
 
+  // ─── Wiki pager (course mode has its own lesson pager) ──────────────────────
+  const pagerNeighbors = React.useMemo(() => {
+    if (courseMode || !wikiActivePath) return { prev: null, next: null }
+    const pages = flattenPages(displayTree)
+    const index = pages.findIndex((p) => p.path === wikiActivePath)
+    if (index < 0) return { prev: null, next: null }
+    const toLink = (node: WikiNode | undefined) =>
+      node?.path ? { title: node.title, path: node.path } : null
+    return { prev: toLink(pages[index - 1]), next: toLink(pages[index + 1]) }
+  }, [courseMode, displayTree, wikiActivePath])
+
   React.useEffect(() => {
     if (!wikiActivePath || !token) {
       setPageLoadedPath(null)
@@ -283,6 +378,9 @@ export function WikiOnlyDetail({
     }
     setPageTitle(activeWikiDoc.title || activeWikiDoc.filename.replace(/\.(md|txt)$/, ''))
     const isLiveUpdate = pageLoadedPath === wikiActivePath
+    // Highlight saves bump the doc version without changing content; skip the
+    // refetch when the bump came from this tab's own write.
+    if (isLiveUpdate && isOwnWrite(activeWikiDoc.id, activeWikiDoc.version)) return
     if (!isLiveUpdate) {
       setPageLoading(true)
       setPageLoadedPath(null)
@@ -307,13 +405,19 @@ export function WikiOnlyDetail({
   const handleWikiSelect = React.useCallback((path: string, docNumber?: number | null) => {
     setWikiActivePath(path)
     const num = docNumber ?? wikiDocs.find((d) => (d.path + d.filename).replace(/^\/wiki\/?/, '') === path)?.document_number ?? null
-    lastWikiDocNumberRef.current = num
     if (num != null) {
       // Our own URL write — mark handled so the sync effect never re-applies it.
       handledUrlDocNumberRef.current = num
-      updateParam('p', String(num))
+      // pushState so each page is a back-button stop.
+      updateParam('p', String(num), 'push')
     }
   }, [updateParam, wikiDocs])
+
+  const handleRecentSelect = React.useCallback(() => {
+    handledUrlDocNumberRef.current = null
+    setWikiActivePath(null)
+    updateParam('p', null, 'push')
+  }, [updateParam])
 
   // Advancing completes the lesson being read (locks are a progression cue, not
   // enforcement — a deep-linked read still counts) and moves to the next.
@@ -324,14 +428,6 @@ export function WikiOnlyDetail({
     }
     handleWikiSelect(forward.path)
   }, [forward, activeWikiDoc, markComplete, handleWikiSelect])
-
-  const wikiPathSet = React.useMemo(() => {
-    const set = new Set<string>()
-    for (const d of wikiDocs) {
-      set.add((d.path + d.filename).replace(/^\/wiki\/?/, ''))
-    }
-    return set
-  }, [wikiDocs])
 
   const handleWikiNavigate = React.useCallback(
     (path: string) => {
@@ -357,6 +453,30 @@ export function WikiOnlyDetail({
     [handleWikiSelect, wikiActivePath, wikiPathSet],
   )
 
+  // ─── Page deletion (structural pages are protected, like the MCP delete tool) ─
+  const [confirmingDelete, setConfirmingDelete] = React.useState(false)
+  const isStructuralPage = wikiActivePath === 'overview.md' || wikiActivePath === 'log.md'
+
+  const handleDeletePage = React.useCallback(async () => {
+    if (!activeWikiDoc || !token) return
+    const target = pagerNeighbors.next ?? pagerNeighbors.prev
+    try {
+      await apiFetch(`/v1/documents/${activeWikiDoc.id}`, token, { method: 'DELETE' })
+    } catch {
+      toast.error('Failed to delete page')
+      return
+    }
+    setConfirmingDelete(false)
+    setDocuments((prev) => prev.filter((d) => d.id !== activeWikiDoc.id))
+    if (target) {
+      handleWikiSelect(target.path)
+      return
+    }
+    // No neighbor (course mode or last page) — let the default pick take over.
+    setWikiActivePath(null)
+    updateParam('p', null)
+  }, [activeWikiDoc, token, pagerNeighbors, setDocuments, handleWikiSelect, updateParam])
+
   const openSourceDoc = React.useCallback((doc: DocumentListItem) => {
     const search = doc.document_number != null ? `?doc=${doc.document_number}` : ''
     router.push(`/wikis/${kbSlug}/files${search}`)
@@ -374,8 +494,21 @@ export function WikiOnlyDetail({
 
   const showMainLoading =
     loading ||
-    (hasNavigableWiki && !wikiActivePath) ||
+    (courseMode && hasNavigableWiki && !wikiActivePath) ||
     (!!wikiActivePath && pageLoadedPath !== wikiActivePath)
+
+  const activityRefreshKey = React.useMemo(
+    () => documents.map((document) => [
+      document.id,
+      document.version,
+      document.status,
+      document.archived,
+      document.title,
+      document.path,
+      document.filename,
+    ].join(':')).join('|'),
+    [documents],
+  )
 
   return (
     <div className="flex h-full flex-col">
@@ -399,6 +532,8 @@ export function WikiOnlyDetail({
               const doc = documents.find((d) => d.id === docId)
               if (doc) openSourceDoc(doc)
             }}
+            recentActive={!courseMode && wikiActivePath == null}
+            onRecentSelect={courseMode ? undefined : handleRecentSelect}
             courseMode={courseMode}
             courseCurrentPath={currentLessonPath}
             courseProgress={courseMode ? { completed: completedCount, total: lessons.length } : undefined}
@@ -409,6 +544,21 @@ export function WikiOnlyDetail({
             <div className="flex h-full items-center justify-center">
               <Loader2 className="size-5 animate-spin text-muted-foreground" />
             </div>
+          ) : !courseMode && !wikiActivePath ? (
+            <RecentChanges
+              kbId={kbId}
+              kbSlug={kbSlug}
+              kbName={kbName}
+              documents={documents}
+              refreshKey={activityRefreshKey}
+              onWikiNavigate={handleWikiSelect}
+              planSlot={planSummary && planSummary.total > 0 ? (
+                <PlanProgress
+                  summary={planSummary}
+                  onOpen={() => handleWikiSelect('plan.md', planDoc?.document_number ?? null)}
+                />
+              ) : null}
+            />
           ) : hasNavigableWiki && wikiActivePath ? (
             <WikiContent
               content={pageContent}
@@ -429,6 +579,9 @@ export function WikiOnlyDetail({
               onLessonNavigate={handleWikiSelect}
               lessonsTotal={lessons.length}
               lessonsComplete={completedCount}
+              prevPage={pagerNeighbors.prev}
+              nextPage={pagerNeighbors.next}
+              onDelete={isStructuralPage ? null : () => setConfirmingDelete(true)}
             />
           ) : (
             <div className="flex h-full flex-col items-center justify-center gap-4 px-6">
@@ -436,7 +589,7 @@ export function WikiOnlyDetail({
               <div className="max-w-sm text-center">
                 <h3 className="mb-1.5 text-base font-medium">No wiki yet</h3>
                 <p className="text-sm leading-relaxed text-muted-foreground">
-                  Add some sources, then ask Claude to compile a wiki from them.
+                  Connect an AI to create the first pages, or add sources for it to work from.
                 </p>
               </div>
               <div className="mt-2 flex items-center gap-3">
@@ -445,22 +598,51 @@ export function WikiOnlyDetail({
                   className="inline-flex cursor-pointer items-center gap-2 rounded-full bg-foreground px-5 py-2 text-sm font-medium text-background transition-opacity hover:opacity-90"
                 >
                   <UploadIcon className="size-3.5 opacity-60" />
-                  Upload Sources
+                  Upload sources
                 </button>
-                <a
-                  href="https://claude.ai"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="inline-flex items-center gap-2 rounded-full border border-border px-5 py-2 text-sm font-medium transition-colors hover:bg-accent"
-                >
-                  Open Claude
-                  <ArrowUpRight className="size-3.5 opacity-60" />
-                </a>
+                {isLocal ? (
+                  <a
+                    href="https://claude.ai"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-2 rounded-full border border-border px-5 py-2 text-sm font-medium transition-colors hover:bg-accent"
+                  >
+                    Open Claude
+                    <ArrowUpRight className="size-3.5 opacity-60" />
+                  </a>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={openMcpConnectionDock}
+                    className="inline-flex items-center gap-2 rounded-full border border-border px-5 py-2 text-sm font-medium transition-colors hover:bg-accent"
+                  >
+                    Connect AI
+                    <PlugZap className="size-3.5 text-accent-blue" />
+                  </button>
+                )}
               </div>
             </div>
           )}
         </div>
       </div>
+      <Dialog open={confirmingDelete} onOpenChange={setConfirmingDelete}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle>Delete this page?</DialogTitle>
+            <DialogDescription>
+              &ldquo;{pageTitle}&rdquo; will be removed from this wiki. This can&apos;t be undone.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setConfirmingDelete(false)}>
+              Cancel
+            </Button>
+            <Button variant="destructive" onClick={handleDeletePage}>
+              Delete
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

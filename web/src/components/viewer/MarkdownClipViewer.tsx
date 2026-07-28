@@ -229,7 +229,7 @@ export default function MarkdownClipViewer({ documentId, className }: Props) {
 
     ws.onclose = (event) => {
       if (cancelled || event.code !== 4001) return
-      refreshAccessToken().catch(() => {})
+      refreshAccessToken(wsToken).catch(() => {})
     }
 
     return () => {

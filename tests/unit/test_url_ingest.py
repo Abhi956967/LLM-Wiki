@@ -2,14 +2,15 @@
 SSRF/size/magic-byte guards on the download path. No live network — getaddrinfo
 and the httpx transport are mocked, matching test_webclip_ssrf.py."""
 
+import asyncio
 import socket
+import threading
 
 import httpx
-import pytest
-from fastapi import HTTPException
-
 import infra.safe_fetch as sf
+import pytest
 import services.url_ingest as ui
+from fastapi import HTTPException
 from services.url_ingest import UrlIngestService, _derive_filename, _normalize_pdf_url, _sanitize_filename
 
 _REAL_ASYNC_CLIENT = httpx.AsyncClient
@@ -75,6 +76,46 @@ class TestDeriveFilename:
 
 
 class TestDownloadGuards:
+
+    async def test_dns_resolution_runs_off_event_loop(self, monkeypatch):
+        event_loop_thread = threading.get_ident()
+        resolver_threads: list[int] = []
+
+        def resolve(host: str) -> str:
+            resolver_threads.append(threading.get_ident())
+            return "93.184.216.34"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=PDF_BYTES)
+
+        monkeypatch.setattr(ui, "resolve_public_ip", resolve)
+        monkeypatch.setattr(ui.httpx, "AsyncClient", _client_with_transport(handler))
+
+        pdf = await _service()._download("https://example.com/doc.pdf")
+
+        assert pdf.data == PDF_BYTES
+        assert resolver_threads
+        assert resolver_threads[0] != event_loop_thread
+
+    async def test_overall_deadline_includes_dns_resolution(self, monkeypatch):
+        release_resolver = threading.Event()
+
+        def blocked_resolve(host: str) -> str:
+            release_resolver.wait(timeout=1)
+            return "93.184.216.34"
+
+        monkeypatch.setattr(ui, "DOWNLOAD_TIMEOUT", 0.01)
+        monkeypatch.setattr(ui, "resolve_public_ip", blocked_resolve)
+
+        try:
+            with pytest.raises(HTTPException) as exc:
+                await _service()._download("https://example.com/doc.pdf")
+        finally:
+            release_resolver.set()
+            await asyncio.sleep(0)
+
+        assert exc.value.status_code == 400
+        assert "timeout" in exc.value.detail
 
     async def test_downloads_pdf_with_pinned_ip(self, monkeypatch):
         captured: dict = {}

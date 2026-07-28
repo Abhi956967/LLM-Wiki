@@ -18,6 +18,13 @@ class _RecordingS3:
 USER_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 USER_EMAIL = "alice@test.com"
 KB_ID = "11111111-1111-1111-1111-111111111111"
+INVALID_QUIZ = """```quiz
+Q: What does koji contribute?
+- [x] Enzymes
+- [ ] Alcohol
+E: Koji supplies enzymes.
+```
+"""
 
 
 @pytest.fixture(autouse=True)
@@ -35,6 +42,22 @@ async def seed_user_and_kb(pool):
 
 
 class TestCreateNote:
+
+    async def test_invalid_quiz_is_rejected_without_persistence(self, client, pool):
+        resp = await client.post(
+            f"/v1/knowledge-bases/{KB_ID}/documents/note",
+            headers=auth_headers(USER_ID),
+            json={"filename": "invalid-quiz.md", "content": INVALID_QUIZ},
+        )
+
+        assert resp.status_code == 422
+        assert "required `questions:`" in resp.text
+        count = await pool.fetchval(
+            "SELECT COUNT(*) FROM documents WHERE knowledge_base_id = $1 AND filename = $2",
+            KB_ID,
+            "invalid-quiz.md",
+        )
+        assert count == 0
 
     async def test_creates_note_with_content(self, client):
         resp = await client.post(
@@ -120,6 +143,28 @@ class TestCreateNote:
 
 
 class TestUpdateContent:
+
+    async def test_invalid_quiz_preserves_content_and_version(self, client):
+        headers = auth_headers(USER_ID)
+        original = "Original content. " + "x " * 60
+        create_resp = await client.post(
+            f"/v1/knowledge-bases/{KB_ID}/documents/note",
+            headers=headers,
+            json={"filename": "valid-before-update.md", "content": original},
+        )
+        doc_id = create_resp.json()["id"]
+
+        update_resp = await client.put(
+            f"/v1/documents/{doc_id}/content",
+            headers=headers,
+            json={"content": INVALID_QUIZ},
+        )
+
+        assert update_resp.status_code == 422
+        assert "required `questions:`" in update_resp.text
+        stored = await client.get(f"/v1/documents/{doc_id}/content", headers=headers)
+        assert stored.json()["content"] == original
+        assert stored.json()["version"] == 0
 
     async def test_update_bumps_version(self, client):
         headers = auth_headers(USER_ID)

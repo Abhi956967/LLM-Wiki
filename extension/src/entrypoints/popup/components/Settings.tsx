@@ -78,11 +78,12 @@ export default function Settings({ onBack, onModeChange, isSignedIn, onSignOut }
     validatingRef.current = false;
     setChecking(false);
     if (!connected) {
-      await setMode("cloud");
-      setModeState("cloud");
+      const storedMode = await getMode();
+      setModeState(storedMode);
       setShowLocalConfig(true);
-      onModeChange("cloud");
-      setMessage(`Could not connect to ${normalized}/health. Cloud remains active.`);
+      setMessage(
+        `Could not connect to ${normalized}/health. Your ${storedMode} preference was kept.`,
+      );
       return false;
     }
     await setLocalUrl(normalized);

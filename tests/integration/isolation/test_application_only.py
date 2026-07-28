@@ -7,15 +7,16 @@ level WHERE user_id clauses protect data access.
 If isolation holds here, the application layer works independently of RLS.
 """
 
-import pytest
 
 from tests.helpers.jwt import auth_headers
 from tests.integration.isolation.conftest import (
-    USER_A_ID, USER_B_ID,
-    KB_A_ID, KB_B_ID,
-    DOC_A_ID, DOC_A2_ID, DOC_B_ID,
-    KEY_A_ID, KEY_B_ID,
-    REF_B_ID,
+    DOC_A_ID,
+    DOC_B_ID,
+    KB_A_ID,
+    KB_B_ID,
+    KEY_B_ID,
+    USER_A_ID,
+    USER_B_ID,
 )
 
 
@@ -90,6 +91,55 @@ class TestReadIsolationWithoutRLS:
         )
         assert resp.status_code == 200
         assert resp.json()["content"] == "Alice secret content"
+
+
+class TestEventIsolationWithoutRLS:
+    """The event endpoint must isolate tenants using application filters alone."""
+
+    async def test_fixture_contains_both_event_streams(self, pool):
+        rows = await pool.fetch(
+            "SELECT DISTINCT knowledge_base_id::text, user_id::text "
+            "FROM knowledge_base_events"
+        )
+        ownership = {
+            (row["knowledge_base_id"], row["user_id"])
+            for row in rows
+        }
+        assert (KB_A_ID, USER_A_ID) in ownership
+        assert (KB_B_ID, USER_B_ID) in ownership
+
+    async def test_own_feed_excludes_other_tenant_events(self, client_no_rls):
+        resp = await client_no_rls.get(
+            f"/v1/knowledge-bases/{KB_A_ID}/events",
+            headers=auth_headers(USER_A_ID),
+        )
+        assert resp.status_code == 200
+        titles = {event["subject_title"] for event in resp.json()["items"]}
+        assert "Alice KB" in titles
+        assert "Bob KB" not in titles
+
+    async def test_cross_tenant_feed_returns_404(self, client_no_rls):
+        resp = await client_no_rls.get(
+            f"/v1/knowledge-bases/{KB_B_ID}/events",
+            headers=auth_headers(USER_A_ID),
+        )
+        assert resp.status_code == 404
+
+    async def test_isolation_is_bidirectional(self, client_no_rls):
+        own = await client_no_rls.get(
+            f"/v1/knowledge-bases/{KB_B_ID}/events",
+            headers=auth_headers(USER_B_ID),
+        )
+        assert own.status_code == 200
+        titles = {event["subject_title"] for event in own.json()["items"]}
+        assert "Bob KB" in titles
+        assert "Alice KB" not in titles
+
+        forbidden = await client_no_rls.get(
+            f"/v1/knowledge-bases/{KB_A_ID}/events",
+            headers=auth_headers(USER_B_ID),
+        )
+        assert forbidden.status_code == 404
 
 
 class TestWriteIsolationWithoutRLS:

@@ -39,7 +39,7 @@ class TestCreateKB:
             kb_id,
         )
         filenames = [d["filename"] for d in docs]
-        assert "log.md" in filenames
+        assert "log.md" not in filenames
         assert "overview.md" in filenames
         overview = next(d for d in docs if d["filename"] == "overview.md")
         assert overview["content"].startswith("---\n")
@@ -105,8 +105,35 @@ class TestListAndGetKB:
         data = resp.json()
         assert "source_count" in data
         assert "wiki_page_count" in data
-        # Scaffold creates overview.md and log.md in /wiki/
-        assert data["wiki_page_count"] == 2
+        # Activity is database-backed; the only scaffolded page is Overview.
+        assert data["wiki_page_count"] == 1
+
+    async def test_lesson_counts_exclude_scaffold_and_track_completion(self, client, pool):
+        headers = auth_headers(USER_ID)
+        create_resp = await client.post(
+            "/v1/knowledge-bases", headers=headers,
+            json={"name": "A Course", "kind": "course"},
+        )
+        kb_id = create_resp.json()["id"]
+
+        await pool.execute(
+            "INSERT INTO documents (knowledge_base_id, user_id, filename, title, path, "
+            "file_type, status, content, metadata) "
+            "VALUES ($1, $2, 'lesson-1.md', 'Lesson 1', '/wiki/', 'md', 'ready', 'x', "
+            "'{\"course\": {\"status\": \"complete\"}}'::jsonb)",
+            kb_id, USER_ID,
+        )
+        await pool.execute(
+            "INSERT INTO documents (knowledge_base_id, user_id, filename, title, path, "
+            "file_type, status, content) "
+            "VALUES ($1, $2, 'lesson-2.md', 'Lesson 2', '/wiki/', 'md', 'ready', 'x')",
+            kb_id, USER_ID,
+        )
+
+        resp = await client.get(f"/v1/knowledge-bases/{kb_id}", headers=headers)
+        data = resp.json()
+        assert data["lesson_count"] == 2
+        assert data["lessons_completed"] == 1
 
 
 class TestUpdateKB:

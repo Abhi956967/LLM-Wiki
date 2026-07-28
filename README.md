@@ -39,6 +39,8 @@ Here's how to get started locally.
 
 **1. Install.** Clone the repo and install the Python and web dependencies.
 
+macOS / Linux:
+
 ```bash
 git clone https://github.com/lucasastorian/llmwiki.git
 cd llmwiki
@@ -47,18 +49,43 @@ pip install -r api/requirements.txt -r mcp/requirements.txt
 cd web && npm install && cd ..
 ```
 
-**2. Point it at a folder of your files** — PDFs, Word documents, PowerPoints, Markdown, notes. LLM Wiki indexes them into a local search index so they show up in the app and Claude can read them. Your files stay where they are; nothing is moved or uploaded.
+Windows (PowerShell):
+
+```powershell
+git clone https://github.com/lucasastorian/llmwiki.git
+cd llmwiki
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r api/requirements.txt -r mcp/requirements.txt
+cd web; npm install; cd ..
+```
+
+If activation is blocked by your execution policy, run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once, or skip activation and use `.venv\Scripts\python` in place of `python` below.
+
+**2. Point it at a folder of your files** — PDFs, Word documents, PowerPoints, Markdown, notes. Use any folder on your disk (it does **not** go inside this repo): the one that already holds your documents, or a fresh empty one. LLM Wiki indexes it into a local search index so the files show up in the app and Claude can read them. It never moves, modifies, or uploads your files — the only things it adds are a `wiki/` folder for generated pages and a hidden `.llmwiki/` index (see [What happens on disk](#what-happens-on-disk)).
 
 ```bash
-./llmwiki open ~/research
+./llmwiki open ~/research                     # macOS / Linux
+python llmwiki open C:\Users\you\research     # Windows
 ```
 
 This initializes the workspace, indexes the folder, starts the API and web app, and opens [localhost:3000](http://localhost:3000).
+Local mode is intentionally loopback-only: the API listens on `127.0.0.1` and does not support LAN or remote binding.
+
+To preview the hosted onboarding UX locally without authentication or API writes, start the web app with the development-only preview flag and open [localhost:3000/onboarding](http://localhost:3000/onboarding):
+
+```bash
+cd web
+NEXT_PUBLIC_ONBOARDING_PREVIEW=true npm run dev
+```
+
+Restart the development server after changing this flag. The preview simulates creation and completion in memory; it does not create a wiki or change onboarding state.
 
 **3. Connect Claude over MCP.** MCP enables Claude to read, write, and search your wiki.
 
 ```bash
-./llmwiki mcp-config ~/research
+./llmwiki mcp-config ~/research                     # macOS / Linux
+python llmwiki mcp-config C:\Users\you\research     # Windows
 ```
 
 Paste the printed JSON into `claude_desktop_config.json` (Claude Desktop) or `.claude/settings.json` (Claude Code). One workspace is one MCP server entry, so add one per folder. Then tell Claude: *"Read the guide, then ingest my sources and start building the wiki."*
@@ -67,7 +94,7 @@ Paste the printed JSON into `claude_desktop_config.json` (Claude Desktop) or `.c
 
 A routine prompt that works well:
 
-> *Read the guide. Find everything added to the workspace since your last run — new sources, clips, and highlights. For each one, read it and update the wiki: write new pages where they're warranted, fold new material into existing pages, and fix any cross-references or citations it affects. Append a short note to `wiki/log.md` summarizing what changed.*
+> *Read the guide. Find everything added to the workspace since your last run — new sources, clips, and highlights. For each one, read it and update the wiki: write new pages where they're warranted, fold new material into existing pages, and fix any cross-references or citations it affects.*
 
 Then schedule that prompt to run nightly. [Claude Code Routines](https://code.claude.com/docs/en/routines) run it on Anthropic's cloud on a fixed cadence even when your laptop is closed — create one at [claude.ai/code/routines](https://claude.ai/code/routines), with `/schedule` in the CLI, or from Claude Cowork — while a [Desktop scheduled task](https://code.claude.com/docs/en/desktop-scheduled-tasks) runs the same prompt on your own machine. Either way the wiki compounds: a year from now you can open it and read back the ideas you were working through a year ago.
 
@@ -105,7 +132,6 @@ LLM Wiki adds exactly two things to the folder you point it at. Your source file
   data.xlsx
   wiki/                      # generated pages — created by LLM Wiki
     overview.md
-    log.md
     concepts/
       attention.md
   .llmwiki/                  # index + cache — hidden, rebuildable
@@ -125,14 +151,14 @@ Once connected over MCP, Claude works the wiki through a small, deliberate set o
 | Tool | What it does |
 |------|--------------|
 | `guide` | Orients Claude — how the vault works and which knowledge bases exist. It calls this first. |
-| `create_knowledge_base` | Creates a knowledge base and starter wiki pages (`overview.md`, `log.md`); local mode returns the existing singleton workspace. |
+| `create_knowledge_base` | Creates a knowledge base and starter `overview.md`; local mode returns the existing singleton workspace. |
 | `list_knowledge_bases` | Lists your knowledge bases and their slugs (every other tool takes one). |
 | `search` | Browse files, full-text search across content, or query the citation graph — what cites what, plus stale or uncited pages. |
 | `read` | Read documents — a single file or a glob batch, PDF/office page ranges, optionally with embedded images. |
 | `create` | Create a wiki page, note, or asset (SVG diagram, CSV) with footnote citations back to sources. |
 | `edit` | Find-and-replace exact text in an existing page. |
 | `append` | Add content to the end of a page. |
-| `delete` | Remove pages or sources by path or glob (`overview.md` and `log.md` are protected). |
+| `delete` | Remove pages or sources by path or glob (`overview.md` and any legacy `log.md` are protected). |
 | `lint` | Deterministic hygiene checks — citation resolution, dangling links, orphan and stale pages, frontmatter consistency. |
 
 Writes go to the source of truth first — a file on disk in local mode, Postgres in hosted mode — then the search index updates. So when Claude creates `/wiki/concepts/attention.md`, it's a real file (or row) immediately, not a pending change.
