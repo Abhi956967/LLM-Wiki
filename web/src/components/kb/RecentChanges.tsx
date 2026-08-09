@@ -180,20 +180,17 @@ export function RecentChanges({
 
   return (
     <div className="h-full overflow-y-auto bg-background">
-      <div className="mx-auto w-full max-w-4xl px-6 pb-20 pt-12 sm:px-10 sm:pt-16">
+      <div className="mx-auto w-full max-w-4xl px-6 pb-16 pt-8 sm:px-10 sm:pt-10">
         <header>
-          <p className="mb-3 text-[10px] font-semibold uppercase tracking-[0.1em] text-muted-foreground/55">
+          <p className="mb-2 text-[10px] font-semibold uppercase tracking-[0.1em] text-muted-foreground/55">
             {kbName}
           </p>
-          <h1 className="text-[30px] font-bold tracking-tight text-foreground sm:text-[32px]">
+          <h1 className="text-xl font-semibold tracking-tight text-foreground">
             Recent changes
           </h1>
-          <p className="mt-2 max-w-[62ch] text-sm leading-6 text-muted-foreground">
-            The latest pages, edits, and sources in this wiki.
-          </p>
         </header>
 
-        {planSlot && <div className="mt-8">{planSlot}</div>}
+        {planSlot && <div className="mt-6">{planSlot}</div>}
 
         {loading && rawEvents.length === 0 ? (
           <TimelineSkeleton />
@@ -206,7 +203,7 @@ export function RecentChanges({
             </p>
           </div>
         ) : (
-          <div className="mt-8 space-y-5">
+          <div className="mt-6 space-y-5">
             {groups.map((group) => (
               <section key={group.key} aria-labelledby={`activity-${group.key}`}>
                 <h2
