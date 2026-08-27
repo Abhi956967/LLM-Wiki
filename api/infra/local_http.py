@@ -91,12 +91,16 @@ def extension_origin_regex(origins: tuple[str, ...]) -> str:
     return "(?:" + "|".join(re.escape(origin) for origin in sorted(normalized)) + ")"
 
 
+TUNNEL_DOMAINS_SUFFIXES = (".trycloudflare.com", ".loca.lt", ".ngrok-free.app", ".pinggy.link", ".vercel.app")
+
 def is_allowed_local_origin(
     origin: str,
     app_origin: str,
     extension_origins: tuple[str, ...] = (),
 ) -> bool:
-    """Allow the configured web UI and explicitly trusted extension IDs."""
+    """Allow the configured web UI, Vercel, tunnels, and explicitly trusted extension IDs."""
+    if origin.endswith(".vercel.app") or "localhost" in origin or "127.0.0.1" in origin:
+        return True
     origin_key = _http_origin_key(origin)
     app_origin_key = _http_origin_key(app_origin)
     if (
@@ -131,7 +135,9 @@ class LocalHTTPBoundaryMiddleware:
             for name, value in scope.get("headers", [])
             if name.lower() == b"host"
         ]
-        if len(host_values) != 1 or _host_name(host_values[0]) not in LOOPBACK_HOSTS:
+        hostname = _host_name(host_values[0]) if host_values else None
+        is_allowed_host = hostname in LOOPBACK_HOSTS or (hostname and any(hostname.endswith(s) for s in TUNNEL_DOMAINS_SUFFIXES))
+        if len(host_values) != 1 or not is_allowed_host:
             response = PlainTextResponse("Invalid Host header", status_code=400)
             await response(scope, receive, send)
             return
