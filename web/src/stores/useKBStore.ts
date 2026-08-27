@@ -18,7 +18,10 @@ type KBState = {
   setKBKind: (id: string, kind: 'wiki' | 'course') => Promise<void>
 }
 
+const isLocal = process.env.NEXT_PUBLIC_MODE === 'local'
+
 function getToken(): string {
+  if (isLocal) return 'local'
   const token = useUserStore.getState().accessToken
   if (!token) throw new Error('Not authenticated')
   return token
