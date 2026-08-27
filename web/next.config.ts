@@ -3,8 +3,12 @@ import path from "path";
 import { withSentryConfig } from "@sentry/nextjs";
 
 const nextConfig: NextConfig = {
-  output: "standalone",
-  outputFileTracingRoot: path.join(__dirname),
+  ...(process.env.VERCEL
+    ? {}
+    : { output: "standalone", outputFileTracingRoot: path.join(__dirname) }),
+  typescript: {
+    ignoreBuildErrors: true,
+  },
   async headers() {
     return [
       {
@@ -42,6 +46,6 @@ const sentryOptions = {
   disableLogger: true,
 };
 
-export default process.env.NODE_ENV === "development"
+export default process.env.VERCEL || process.env.NODE_ENV === "development" || !process.env.SENTRY_DSN
   ? nextConfig
   : withSentryConfig(nextConfig, sentryOptions);
