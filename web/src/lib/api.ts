@@ -60,6 +60,8 @@ export async function apiFetch<T>(
   const request = (requestToken: string) => {
     const headers = new Headers(fetchOptions.headers)
     if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
+    headers.set('Bypass-Tunnel-Reminder', 'true')
+    headers.set('ngrok-skip-browser-warning', 'true')
 
     // In local mode, skip Authorization header (API doesn't check it)
     if (!isLocal && requestToken) {

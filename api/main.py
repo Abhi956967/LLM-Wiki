@@ -221,10 +221,8 @@ if settings.MODE == "local":
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.APP_URL],
-    # Local clipping may be initiated by the popup or extension background
-    # worker. Hosted mode keeps its existing, web-app-only CORS policy.
-    allow_origin_regex=local_extension_origin_regex,
+    allow_origins=[settings.APP_URL, "https://llm-wiki-umber.vercel.app", "http://localhost:3000"],
+    allow_origin_regex=r"https://.*\.vercel\.app|chrome-extension://.*|http://localhost:\d+",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
