@@ -5,15 +5,16 @@ WORKDIR /app
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PORT=8080 \
-    PYTHONPATH=/app
+    PYTHONPATH=/app/mcp
 
 RUN pip install --no-cache-dir --upgrade pip
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt pypdf
+COPY mcp/requirements.txt ./mcp/requirements.txt
+RUN pip install --no-cache-dir -r mcp/requirements.txt pypdf
 
 COPY . .
 
+WORKDIR /app/mcp
 ENV MODE=hosted
 EXPOSE 8080
 
