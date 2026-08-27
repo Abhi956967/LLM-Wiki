@@ -1,11 +1,7 @@
 import type { NextConfig } from "next";
-import path from "path";
 import { withSentryConfig } from "@sentry/nextjs";
 
 const nextConfig: NextConfig = {
-  ...(process.env.VERCEL
-    ? {}
-    : { output: "standalone", outputFileTracingRoot: path.join(__dirname) }),
   typescript: {
     ignoreBuildErrors: true,
   },
