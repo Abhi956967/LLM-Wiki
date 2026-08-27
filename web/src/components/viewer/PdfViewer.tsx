@@ -14,8 +14,6 @@ import { computePdfAnchor, pdfRectsToViewport } from '@/lib/highlights/pdfAnchor
 import 'react-pdf/dist/Page/TextLayer.css'
 import 'react-pdf/dist/Page/AnnotationLayer.css'
 
-ensurePdfWorker()
-
 type Props = {
   fileUrl: string
   documentId?: string
@@ -28,6 +26,9 @@ type Props = {
 const VIRTUALIZE_BUFFER = 2
 
 export default function PdfViewer({ fileUrl, documentId, title, className, initialPage, hideToolbar }: Props) {
+  useEffect(() => {
+    ensurePdfWorker()
+  }, [])
   const [numPages, setNumPages] = useState(0)
   const [currentPage, setCurrentPage] = useState(1)
   const containerRef = useRef<HTMLDivElement>(null)

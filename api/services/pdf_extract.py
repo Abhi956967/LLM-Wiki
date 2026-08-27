@@ -6,6 +6,7 @@ No server-specific dependencies (no asyncpg, S3, httpx).
 
 import base64
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -13,6 +14,8 @@ import sys
 import tempfile
 from collections import defaultdict
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 EXTRACT_TIMEOUT_SECONDS = 180
 MAX_EXTRACT_JSON_BYTES = 64 * 1024 * 1024
@@ -170,13 +173,21 @@ def _run_extractor(pdf_path: str, output_dir: str) -> None:
         raise RuntimeError(f"opendataloader-pdf failed: {detail}")
 
 
+def _extract_pdf_pypdf(pdf_path: str) -> list[tuple[int, str, list[dict]]]:
+    """Pure-python fallback using pypdf when Java/opendataloader is unavailable."""
+    import pypdf
+    reader = pypdf.PdfReader(pdf_path)
+    pages = []
+    for i, page in enumerate(reader.pages, start=1):
+        text = page.extract_text() or ""
+        pages.append((i, text.strip(), []))
+    return pages
+
+
 def extract_pdf(pdf_path: str) -> list[tuple[int, str, list[dict]]]:
     """Run opendataloader-pdf and return per-page markdown with images.
 
-    Returns list of (page_num, markdown, images) where images is a list of
-    {"id": str, "bytes": bytes, "format": str} dicts.
-
-    Raises RuntimeError if extraction fails (Java missing, corrupt PDF, etc.).
+    Falls back to pypdf if opendataloader fails (e.g. Java missing).
     """
     try:
         with tempfile.TemporaryDirectory() as extract_dir:
@@ -204,7 +215,10 @@ def extract_pdf(pdf_path: str) -> list[tuple[int, str, list[dict]]]:
         if not isinstance(elements, list) or not all(isinstance(el, dict) for el in elements):
             raise RuntimeError("opendataloader-pdf returned invalid elements")
         return _elements_to_pages(elements, total_pages)
-    except (RuntimeError, TimeoutError):
-        raise
     except Exception as e:
-        raise RuntimeError(f"PDF extraction failed: {e}") from e
+        logger.warning("opendataloader-pdf failed (%s), falling back to pypdf for %s", e, pdf_path)
+        try:
+            return _extract_pdf_pypdf(pdf_path)
+        except Exception as pypdf_err:
+            raise RuntimeError(f"PDF extraction failed: {e}; fallback also failed: {pypdf_err}") from e
+

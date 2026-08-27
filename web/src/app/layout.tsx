@@ -101,6 +101,7 @@ export default function RootLayout({
     <html lang="en" suppressHydrationWarning>
       <head>
         <script
+          id="theme-script"
           dangerouslySetInnerHTML={{ __html: themeScript }}
           suppressHydrationWarning
         />

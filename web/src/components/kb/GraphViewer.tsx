@@ -373,7 +373,7 @@ export function GraphViewer({ kbId, focusNodeId, onNavigateToDoc }: Props) {
             nodeCanvasObject={nodeCanvasObject}
             nodePointerAreaPaint={(node: any, color: string, ctx: CanvasRenderingContext2D) => {
               ctx.beginPath()
-              ctx.arc(node.x!, node.y!, 5, 0, 2 * Math.PI)
+              ctx.arc(node.x!, node.y!, 12, 0, 2 * Math.PI)
               ctx.fillStyle = color
               ctx.fill()
             }}
