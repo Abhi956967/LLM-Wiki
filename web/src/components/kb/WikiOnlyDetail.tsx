@@ -298,8 +298,15 @@ export function WikiOnlyDetail({
 
   const activeWikiDoc = React.useMemo(() => {
     if (!wikiActivePath) return null
-    return wikiDocs.find((d) => (d.path + d.filename).replace(/^\/wiki\/?/, '') === wikiActivePath) ?? null
-  }, [wikiActivePath, wikiDocs])
+    const clean = wikiActivePath.replace(/\.md$/, '').toLowerCase()
+    return (
+      wikiDocs.find((d) => (d.path + d.filename).replace(/^\/wiki\/?/, '') === wikiActivePath) ??
+      documents.find((d) => (d.path + d.filename).replace(/^\//, '') === wikiActivePath) ??
+      documents.find((d) => d.filename.toLowerCase() === wikiActivePath.toLowerCase()) ??
+      documents.find((d) => d.filename.replace(/\.md$/, '').toLowerCase() === clean) ??
+      null
+    )
+  }, [wikiActivePath, wikiDocs, documents])
 
   const activeWikiVersion = activeWikiDoc?.version ?? -1
   const activeWikiDocId = activeWikiDoc?.id ?? null
@@ -404,14 +411,21 @@ export function WikiOnlyDetail({
 
   const handleWikiSelect = React.useCallback((path: string, docNumber?: number | null) => {
     setWikiActivePath(path)
-    const num = docNumber ?? wikiDocs.find((d) => (d.path + d.filename).replace(/^\/wiki\/?/, '') === path)?.document_number ?? null
+    const clean = path.replace(/\.md$/, '').toLowerCase()
+    const found =
+      documents.find((d) => (d.path + d.filename).replace(/^\/wiki\/?/, '') === path) ??
+      documents.find((d) => (d.path + d.filename).replace(/^\//, '') === path) ??
+      documents.find((d) => d.filename.toLowerCase() === path.toLowerCase()) ??
+      documents.find((d) => d.filename.replace(/\.md$/, '').toLowerCase() === clean)
+
+    const num = docNumber ?? found?.document_number ?? null
     if (num != null) {
       // Our own URL write — mark handled so the sync effect never re-applies it.
       handledUrlDocNumberRef.current = num
       // pushState so each page is a back-button stop.
       updateParam('p', String(num), 'push')
     }
-  }, [updateParam, wikiDocs])
+  }, [updateParam, documents])
 
   const handleRecentSelect = React.useCallback(() => {
     handledUrlDocNumberRef.current = null
@@ -436,21 +450,37 @@ export function WikiOnlyDetail({
         nextPath = path.replace(/^\/wiki\/?/, '')
       } else if (path.startsWith('/')) {
         nextPath = path.slice(1)
-      } else if (!wikiPathSet.has(path) && wikiActivePath) {
-        const dir = wikiActivePath.includes('/')
-          ? wikiActivePath.substring(0, wikiActivePath.lastIndexOf('/'))
-          : ''
-        let resolved = path.startsWith('./')
-          ? (dir ? dir + '/' : '') + path.slice(2)
-          : (dir ? dir + '/' : '') + path
-        while (resolved.includes('../')) {
-          resolved = resolved.replace(/[^/]*\/\.\.\//, '')
+      } else {
+        const clean = path.replace(/\.md$/, '').toLowerCase()
+        const targetDoc = documents.find(
+          (d) =>
+            d.filename.toLowerCase() === path.toLowerCase() ||
+            d.filename.replace(/\.md$/, '').toLowerCase() === clean ||
+            (d.path + d.filename).replace(/^\//, '').toLowerCase() === path.toLowerCase() ||
+            (d.path + d.filename).replace(/^\/wiki\/?/, '').toLowerCase() === path.toLowerCase(),
+        )
+        if (targetDoc) {
+          const docPath = (targetDoc.path + targetDoc.filename).replace(/^\/wiki\/?/, '').replace(/^\//, '')
+          handleWikiSelect(docPath, targetDoc.document_number)
+          return
         }
-        nextPath = resolved
+
+        if (!wikiPathSet.has(path) && wikiActivePath) {
+          const dir = wikiActivePath.includes('/')
+            ? wikiActivePath.substring(0, wikiActivePath.lastIndexOf('/'))
+            : ''
+          let resolved = path.startsWith('./')
+            ? (dir ? dir + '/' : '') + path.slice(2)
+            : (dir ? dir + '/' : '') + path
+          while (resolved.includes('../')) {
+            resolved = resolved.replace(/[^/]*\/\.\.\//, '')
+          }
+          nextPath = resolved
+        }
       }
       handleWikiSelect(nextPath)
     },
-    [handleWikiSelect, wikiActivePath, wikiPathSet],
+    [handleWikiSelect, wikiActivePath, wikiPathSet, documents],
   )
 
   // ─── Page deletion (structural pages are protected, like the MCP delete tool) ─

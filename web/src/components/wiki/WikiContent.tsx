@@ -678,7 +678,14 @@ export function WikiContent({ content, title, path, documentId = null, onNavigat
   const description = React.useMemo(() => parseFrontmatterField(content, 'description'), [content])
   const { heading, rest } = React.useMemo(() => extractLeadingH1(body), [body])
   const processedContent = React.useMemo(
-    () => normalizeMathDelimiters(stripLegacyQuizWrapper(rest)),
+    () => {
+      const withWikilinks = rest.replace(/\[\[([^\]|#]+)(?:#[^\]|]+)?(?:\|([^\]]+))?\]\]/g, (_, target, alias) => {
+        const label = alias ? alias.trim() : target.trim()
+        const linkTarget = target.trim().endsWith('.md') ? target.trim() : `${target.trim()}.md`
+        return `[${label}](${linkTarget})`
+      })
+      return normalizeMathDelimiters(stripLegacyQuizWrapper(withWikilinks))
+    },
     [rest],
   )
   const pageTitle = toDisplayTitle(decodeUnicodeEscapes(heading ?? title))

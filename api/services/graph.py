@@ -188,7 +188,7 @@ async def rebuild_local(db, user_id: str) -> dict:
 
     wiki_cursor = await db.execute(
         "SELECT id, filename, path, content FROM documents "
-        "WHERE user_id = ? AND source_kind = 'wiki' AND file_type = 'md' AND content IS NOT NULL",
+        "WHERE user_id = ? AND file_type = 'md' AND content IS NOT NULL",
         (user_id,),
     )
     wiki_pages = rows_to_dicts(wiki_cursor, await wiki_cursor.fetchall())

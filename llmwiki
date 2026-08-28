@@ -173,6 +173,24 @@ def _index_existing_files(ws: Path, db_path: Path, user_id: str, ws_id: str) -> 
                      source_kind, ext or "bin", stat.st_size, content,
                      content_hash, int(stat.st_mtime_ns)),
                 )
+                
+                # If content is text, generate chunks for FTS search
+                if content:
+                    sys.path.insert(0, str(API_DIR))
+                    try:
+                        from services.chunker import chunk_text
+                        chunks = chunk_text(content)
+                        for c in chunks:
+                            chunk_id = str(uuid.uuid4())
+                            conn.execute(
+                                "INSERT INTO document_chunks (id, document_id, chunk_index, content, "
+                                "source_content, page, start_char, token_count, header_breadcrumb) "
+                                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                (chunk_id, doc_id, c.index, c.content, c.content, c.page, c.start_char, c.token_count, c.header_breadcrumb)
+                            )
+                    except Exception:
+                        pass
+
                 indexed += 1
             except Exception as e:
                 print(f"  Warning: could not index {relative}: {e}", file=sys.stderr)
@@ -181,7 +199,7 @@ def _index_existing_files(ws: Path, db_path: Path, user_id: str, ws_id: str) -> 
     conn.close()
 
     if indexed > 0:
-        print(f"✓ Indexed {indexed} existing file(s)")
+        print(f"✓ Indexed {indexed} file(s) with full-text search chunks")
 
 
 def cmd_serve(workspace: str, open_browser: bool = True) -> None:

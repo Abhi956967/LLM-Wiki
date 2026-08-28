@@ -68,7 +68,7 @@ export function GraphViewer({ kbId, focusNodeId, onNavigateToDoc }: Props) {
   const [hoverNodeState, setHoverNodeState] = React.useState<GraphNode | null>(null)
   const [mousePos, setMousePos] = React.useState({ x: 0, y: 0 })
   const [dimensions, setDimensions] = React.useState({ width: 0, height: 0 })
-  const [showSources, setShowSources] = React.useState(false)
+  const [showSources, setShowSources] = React.useState(true)
 
   // Monotonic sequence: only the latest in-flight fetch may apply its result,
   // so a slow stale response can never overwrite fresher data.
@@ -98,14 +98,6 @@ export function GraphViewer({ kbId, focusNodeId, onNavigateToDoc }: Props) {
   }, [kbId, token])
 
   React.useEffect(() => { fetchGraph() }, [fetchGraph])
-
-  // A cites-only wiki has edges, but the wiki-only default filters them all
-  // out — flip the source layer on rather than claiming nothing is indexed.
-  React.useEffect(() => {
-    if (!graphData || focusNodeId) return
-    const hasWikiLinks = graphData.edges.some((e) => e.type === 'links_to')
-    if (!hasWikiLinks && graphData.edges.length > 0) setShowSources(true)
-  }, [graphData, focusNodeId])
 
   // Always track container size — ref is always mounted
   React.useEffect(() => {
@@ -168,14 +160,10 @@ export function GraphViewer({ kbId, focusNodeId, onNavigateToDoc }: Props) {
         (e) => e.source === focusNodeId || e.target === focusNodeId,
       )
     } else {
-      // Global mode: wiki-to-wiki links; the source layer brings citation edges with it
-      const hubTitles = new Set(['overview', 'log'])
-      relevantEdges = relevantEdges.filter(
-        (e) => e.type === 'links_to' || (showSources && e.type === 'cites'),
-      )
+      // Global mode: include all nodes when showSources is true
       relevantNodes = relevantNodes.filter((n) => {
         if (n.source_kind !== 'wiki' && !showSources) return false
-        return !hubTitles.has(n.title.toLowerCase())
+        return true
       })
     }
 

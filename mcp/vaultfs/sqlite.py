@@ -478,6 +478,7 @@ class SqliteVaultFS(VaultFS):
         path_filter: str | None = None,
         annotated_only: bool = False,
         scope: str = "all",
+        tier: str | None = None,
     ) -> list[dict]:
         db = self._db_or_raise()
         # SQLite's chunks_fts only indexes `content` (which already includes
@@ -490,7 +491,7 @@ class SqliteVaultFS(VaultFS):
         sql = (
             "SELECT dc.content, dc.source_content, dc.annotations_text, "
             "dc.has_highlight, dc.page, dc.header_breadcrumb, dc.chunk_index, "
-            "d.filename, d.title, d.path, d.file_type, d.tags, "
+            "d.filename, d.title, d.path, d.relative_path, d.file_type, d.tags, "
             "rank as score "
             "FROM document_chunks dc "
             "JOIN chunks_fts fts ON dc.rowid = fts.rowid "
@@ -498,12 +499,20 @@ class SqliteVaultFS(VaultFS):
             "WHERE chunks_fts MATCH ? AND d.status != 'failed' "
         )
         params: list = [query]
+        if tier:
+            tier_normalized = tier.strip().lower()
+            sql += "AND (d.relative_path LIKE ? OR d.path LIKE ?) "
+            params.extend([f"{tier_normalized}/%", f"/{tier_normalized}/%"])
         if annotated_only:
             sql += "AND dc.has_highlight = 1 "
         if path_filter == "wiki":
             sql += "AND d.source_kind = 'wiki' "
         elif path_filter == "sources":
             sql += "AND d.source_kind != 'wiki' "
+        elif path_filter and path_filter.lower() in ("tier1", "tier2", "tier3"):
+            t = path_filter.lower()
+            sql += "AND (d.relative_path LIKE ? OR d.path LIKE ?) "
+            params.extend([f"{t}/%", f"/{t}/%"])
         sql += "ORDER BY rank LIMIT ?"
         params.append(sql_limit)
 

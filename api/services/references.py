@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 
 _CITATION_RE = re.compile(r"\[\^\d+\]:\s*(.+)$", re.MULTILINE)
 _WIKI_LINK_RE = re.compile(r"(?<!!)\[(?:[^\]]*)\]\(([^)]+)\)")
+_OBSIDIAN_LINK_RE = re.compile(r"\[\[([^\]|#]+)(?:#[^\]|]+)?(?:\|([^\]]+))?\]\]")
 
 
 def parse_citation_filename(raw: str) -> tuple[str, int | None]:
@@ -33,8 +34,9 @@ def parse_citation_filename(raw: str) -> tuple[str, int | None]:
 def parse_wiki_links(content: str, current_dir: str) -> list[str]:
     """Extract internal wiki link paths, resolved relative to current_dir."""
     paths = []
+    # Standard Markdown Links: [text](path.md)
     for match in _WIKI_LINK_RE.finditer(content):
-        href = match.group(1)
+        href = match.group(1).strip()
         if href.startswith(("http", "#", "mailto:", "data:")):
             continue
         if re.search(r"\.(png|jpg|jpeg|gif|webp|svg)$", href, re.IGNORECASE):
@@ -59,6 +61,13 @@ def parse_wiki_links(content: str, current_dir: str) -> list[str]:
             resolved = href
         if resolved:
             paths.append(resolved)
+
+    # Obsidian Wikilinks: [[target]] or [[target|alias]]
+    for match in _OBSIDIAN_LINK_RE.finditer(content):
+        target = match.group(1).strip()
+        if target and not target.startswith(("http", "mailto:")):
+            paths.append(target)
+
     return paths
 
 
@@ -81,9 +90,15 @@ def build_lookup_maps(
         base = re.sub(r"\.(pdf|docx?|pptx?|xlsx?|csv|html?|md|txt)$", "", fn_lower)
         if base not in base_to_doc:
             base_to_doc[base] = doc
-        if doc["path"].startswith("/wiki/"):
-            relative = (doc["path"] + doc["filename"]).replace("/wiki/", "", 1)
-            wiki_path_to_doc[relative.lower()] = doc
+
+        # Relative paths
+        rel = doc.get("relative_path") or ((doc.get("path") or "").lstrip("/") + doc["filename"])
+        rel_lower = rel.lower().lstrip("/")
+        wiki_path_to_doc[rel_lower] = doc
+        wiki_path_to_doc[fn_lower] = doc
+        wiki_path_to_doc[base] = doc
+        if rel_lower.startswith("wiki/"):
+            wiki_path_to_doc[rel_lower.replace("wiki/", "", 1)] = doc
 
     return filename_to_doc, base_to_doc, wiki_path_to_doc
 
@@ -117,14 +132,20 @@ def extract_references(
                 seen.add(key)
                 edges.append({"target_id": target["id"], "type": "cites", "page": page})
 
-    # Wiki cross-references: [text](path.md)
+    # Wiki & Obsidian cross-references
     for link_path in parse_wiki_links(content, wiki_dir):
-        target = wiki_path_to_doc.get(link_path.lower())
+        lp_lower = link_path.lower()
+        target = wiki_path_to_doc.get(lp_lower)
         if not target:
-            target = wiki_path_to_doc.get(link_path.lower() + ".md")
+            target = wiki_path_to_doc.get(lp_lower + ".md")
         if not target:
-            basename = link_path.split("/")[-1].lower()
+            basename = lp_lower.split("/")[-1].removesuffix(".md")
             target = wiki_path_to_doc.get(basename)
+        if not target:
+            target = base_to_doc.get(basename if "basename" in locals() else lp_lower)
+        if not target:
+            target = filename_to_doc.get(lp_lower)
+
         if target and target["id"] != doc_id:
             key = (target["id"], "links_to")
             if key not in seen:
