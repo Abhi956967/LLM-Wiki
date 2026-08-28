@@ -25,13 +25,12 @@ async def _set_rls(conn, user_id: str, claims: dict | None = None):
     if claims:
         jwt_claims = {k: v for k, v in claims.items() if k in ("sub", "aud", "client_id", "scope")}
         jwt_claims.setdefault("sub", user_id)
+        jwt_claims["role"] = "authenticated"
+        await conn.execute("SET LOCAL ROLE authenticated")
+        await conn.execute("SELECT set_config('request.jwt.claims', $1, true)", json.dumps(jwt_claims))
     else:
-        jwt_claims = {"sub": user_id}
-    # Pin the role rather than trusting the token claim — these connections are
-    # always user-scoped, and auth.role() drives RLS policy evaluation.
-    jwt_claims["role"] = "authenticated"
-    await conn.execute("SET LOCAL ROLE authenticated")
-    await conn.execute("SELECT set_config('request.jwt.claims', $1, true)", json.dumps(jwt_claims))
+        jwt_claims = {"sub": user_id, "role": "authenticated"}
+        await conn.execute("SELECT set_config('request.jwt.claims', $1, true)", json.dumps(jwt_claims))
 
 
 @asynccontextmanager
