@@ -194,9 +194,16 @@ class SearchHandler:
         return "\n".join(lines)
 
     def _path_filter_key(self, path: str) -> str | None:
-        """Map a path pattern to a coarse wiki/sources search filter key."""
+        """Map a path pattern to a coarse wiki/sources/tier search filter key."""
         if path in ("*", "**", "**/*"):
             return None
+        clean = path.lstrip("/").lower()
+        if clean.startswith("tier1"):
+            return "tier1"
+        if clean.startswith("tier2"):
+            return "tier2"
+        if clean.startswith("tier3"):
+            return "tier3"
         if path.startswith("/wiki"):
             return "wiki"
         if path in ("/", "/*"):
