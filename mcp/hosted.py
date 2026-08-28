@@ -87,6 +87,11 @@ if ENABLE_OAUTH and settings.SUPABASE_URL and settings.MCP_URL:
         enable_dns_rebinding_protection=True,
         allowed_hosts=_build_allowed_hosts(settings.MCP_URL),
     )
+else:
+    fastmcp_kwargs["transport_security"] = TransportSecuritySettings(
+        enable_dns_rebinding_protection=False,
+        allowed_hosts=["*"],
+    )
 
 mcp = FastMCP(**fastmcp_kwargs)
 
@@ -148,7 +153,8 @@ def _root_protected_resource_route() -> Route:
 app = mcp.streamable_http_app()
 app.router.routes.insert(0, Route("/", root_info))
 app.router.routes.insert(1, Route("/health", health))
-app.router.routes.insert(2, _root_protected_resource_route())
+if ENABLE_OAUTH:
+    app.router.routes.insert(2, _root_protected_resource_route())
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
