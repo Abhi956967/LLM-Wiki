@@ -427,6 +427,9 @@ class PostgresVaultFS(VaultFS):
             path_clause = " AND d.path LIKE '/wiki/%'"
         elif path_filter == "sources":
             path_clause = " AND d.path NOT LIKE '/wiki/%'"
+        elif path_filter and path_filter.lower() in ("tier1", "tier2", "tier3"):
+            t = path_filter.lower()
+            path_clause = f" AND (d.path LIKE '/{t}/%' OR d.path LIKE '{t}/%')"
 
         # Always match against `content` — that's where the PGroonga index
         # lives, and `content` already contains source + annotations
