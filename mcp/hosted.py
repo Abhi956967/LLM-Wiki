@@ -105,8 +105,20 @@ register(mcp, _get_user_id, _fs_factory)
 register_ingest(mcp, _get_user_id, _fs_factory)
 
 
+from starlette.responses import JSONResponse, PlainTextResponse
+
 async def health(request):
     return PlainTextResponse("OK")
+
+
+async def root_info(request):
+    return JSONResponse({
+        "name": "LLM Wiki MCP Server",
+        "status": "online",
+        "mcp_endpoint": settings.MCP_URL or "/mcp",
+        "health": "/health",
+        "database": "PostgreSQL (Connected)"
+    })
 
 
 # RFC 9728 mounts the metadata at /.well-known/oauth-protected-resource/mcp;
@@ -129,8 +141,9 @@ def _root_protected_resource_route() -> Route:
 
 
 app = mcp.streamable_http_app()
-app.router.routes.insert(0, Route("/health", health))
-app.router.routes.insert(1, _root_protected_resource_route())
+app.router.routes.insert(0, Route("/", root_info))
+app.router.routes.insert(1, Route("/health", health))
+app.router.routes.insert(2, _root_protected_resource_route())
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
