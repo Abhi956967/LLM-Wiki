@@ -150,11 +150,38 @@ def _root_protected_resource_route() -> Route:
     )
 
 
-app = mcp.streamable_http_app()
-app.router.routes.insert(0, Route("/", root_info))
-app.router.routes.insert(1, Route("/health", health))
+base_app = mcp.streamable_http_app()
+base_app.router.routes.insert(0, Route("/", root_info))
+base_app.router.routes.insert(1, Route("/health", health))
 if ENABLE_OAUTH:
-    app.router.routes.insert(2, _root_protected_resource_route())
+    base_app.router.routes.insert(2, _root_protected_resource_route())
+
+
+class AcceptHeaderMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            new_headers = []
+            found_accept = False
+            for k, v in scope.get("headers", []):
+                if k.lower() == b"accept":
+                    found_accept = True
+                    val = v.decode("utf-8", "ignore")
+                    if "application/json" not in val or "text/event-stream" not in val:
+                        new_headers.append((b"accept", b"application/json, text/event-stream, */*"))
+                    else:
+                        new_headers.append((k, v))
+                else:
+                    new_headers.append((k, v))
+            if not found_accept:
+                new_headers.append((b"accept", b"application/json, text/event-stream, */*"))
+            scope["headers"] = new_headers
+        await self.app(scope, receive, send)
+
+
+app = AcceptHeaderMiddleware(base_app)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
