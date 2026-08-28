@@ -440,38 +440,66 @@ class PostgresVaultFS(VaultFS):
         # Push scope into SQL so the LIMIT counts only rows the user asked
         # for. The earlier Python-side post-filter could return zero results
         # for narrow scopes even when valid matches existed past the top-N.
-        if scope == "annotations":
-            scope_clause = (
-                " AND dc.annotations_text IS NOT NULL "
-                " AND dc.annotations_text &@~ $2"
-            )
-        elif scope == "source":
-            scope_clause = " AND dc.source_content &@~ $2"
-        else:
-            scope_clause = ""
+        try:
+            if scope == "annotations":
+                scope_clause = (
+                    " AND dc.annotations_text IS NOT NULL "
+                    " AND dc.annotations_text &@~ $2"
+                )
+            elif scope == "source":
+                scope_clause = " AND dc.source_content &@~ $2"
+            else:
+                scope_clause = ""
 
-        rows = await scoped_query(
-            self.user_id,
-            f"SELECT dc.content, dc.source_content, dc.annotations_text, "
-            f"  dc.has_highlight, dc.page, dc.header_breadcrumb, dc.chunk_index, "
-            f"  (dc.source_content &@~ $2) AS source_hit, "
-            f"  (dc.annotations_text IS NOT NULL AND dc.annotations_text &@~ $2) AS annotation_hit, "
-            f"  d.filename, d.title, d.path, d.file_type, d.tags, "
-            f"  pgroonga_score(dc.tableoid, dc.ctid) AS score "
-            f"FROM document_chunks dc "
-            f"JOIN documents d ON dc.document_id = d.id "
-            f"WHERE dc.knowledge_base_id = $1 "
-            f"  AND dc.content &@~ $2 "
-            f"  AND NOT d.archived"
-            f"  AND d.user_id = $3"
-            f"{annotated_clause}"
-            f"{scope_clause}"
-            f"{path_clause} "
-            f"ORDER BY score DESC, dc.chunk_index "
-            f"LIMIT $4",
-            kb_id, query, self.user_id, limit,
-        )
-        return rows
+            rows = await scoped_query(
+                self.user_id,
+                f"SELECT dc.content, dc.source_content, dc.annotations_text, "
+                f"  dc.has_highlight, dc.page, dc.header_breadcrumb, dc.chunk_index, "
+                f"  (dc.source_content &@~ $2) AS source_hit, "
+                f"  (dc.annotations_text IS NOT NULL AND dc.annotations_text &@~ $2) AS annotation_hit, "
+                f"  d.filename, d.title, d.path, d.file_type, d.tags, "
+                f"  pgroonga_score(dc.tableoid, dc.ctid) AS score "
+                f"FROM document_chunks dc "
+                f"JOIN documents d ON dc.document_id = d.id "
+                f"WHERE dc.knowledge_base_id = $1 "
+                f"  AND dc.content &@~ $2 "
+                f"  AND NOT d.archived"
+                f"  AND d.user_id = $3"
+                f"{annotated_clause}"
+                f"{scope_clause}"
+                f"{path_clause} "
+                f"ORDER BY score DESC, dc.chunk_index "
+                f"LIMIT $4",
+                kb_id, query, self.user_id, limit,
+            )
+            return rows
+        except Exception:
+            # Fallback to standard PostgreSQL search for standard Supabase instances
+            words = [w.strip() for w in query.split() if w.strip() and len(w.strip()) > 1]
+            if not words:
+                words = [query]
+            word_conditions = " AND ".join([f"dc.content ILIKE ${i+4}" for i in range(len(words))])
+            params = [kb_id, self.user_id, limit] + [f"%{w}%" for w in words]
+            
+            fallback_sql = (
+                f"SELECT dc.content, dc.source_content, dc.annotations_text, "
+                f"  dc.has_highlight, dc.page, dc.header_breadcrumb, dc.chunk_index, "
+                f"  true AS source_hit, "
+                f"  false AS annotation_hit, "
+                f"  d.filename, d.title, d.path, d.file_type, d.tags, "
+                f"  1.0 AS score "
+                f"FROM document_chunks dc "
+                f"JOIN documents d ON dc.document_id = d.id "
+                f"WHERE dc.knowledge_base_id = $1 "
+                f"  AND ({word_conditions}) "
+                f"  AND NOT d.archived "
+                f"  AND d.user_id = $2 "
+                f"{annotated_clause} "
+                f"{path_clause} "
+                f"ORDER BY dc.chunk_index "
+                f"LIMIT $3"
+            )
+            return await scoped_query(self.user_id, fallback_sql, *params)
 
 
     async def load_source_bytes(self, doc: dict) -> bytes | None:
