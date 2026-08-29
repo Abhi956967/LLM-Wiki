@@ -27,6 +27,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="LLM Wiki local MCP server")
     parser.add_argument("workspace", nargs="?", default=".", help="Path to workspace folder")
     parser.add_argument("--workspace", dest="workspace_flag", default=None, help="Path to workspace folder")
+    parser.add_argument("--tier", dest="tier", default=None, help="Scope MCP server strictly to a tier (tier1, tier2, tier3)")
     return parser.parse_args()
 
 
@@ -89,10 +90,11 @@ def main():
     from tools import register
     from vaultfs import SqliteVaultFS
 
+    tier_title = f" ({args.tier.upper()})" if args.tier else ""
     mcp = FastMCP(
-        name="LLM Wiki",
+        name=f"LLM Wiki{tier_title}",
         instructions=(
-            "You are connected to an LLM Wiki workspace. The user has uploaded files, notes, "
+            f"You are connected to an LLM Wiki workspace{tier_title}. The user has uploaded files, notes, "
             "and documents that you can read, search, edit, and organize. "
             "Call the `guide` tool first to see available knowledge bases and learn the full workflow."
         ),
@@ -101,7 +103,7 @@ def main():
     def _get_user_id(ctx):
         return _LOCAL_USER_ID
 
-    register(mcp, _get_user_id, lambda user_id: SqliteVaultFS(user_id))
+    register(mcp, _get_user_id, lambda user_id: SqliteVaultFS(user_id), tier=args.tier)
 
     @mcp.tool(name="ping", description="Test connectivity")
     async def ping() -> str:

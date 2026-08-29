@@ -414,7 +414,7 @@ class LintHandler:
         return (0, f"{int(value):08d}") if value.isdigit() else (1, value)
 
 
-def register(mcp: FastMCP, get_user_id, fs_factory) -> None:
+def register(mcp: FastMCP, get_user_id, fs_factory, tier: str | None = None) -> None:
     @mcp.tool(
         name="lint",
         description=(

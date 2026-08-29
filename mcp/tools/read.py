@@ -456,7 +456,8 @@ class ReadHandler:
         return header
 
 
-def register(mcp: FastMCP, get_user_id, fs_factory) -> None:
+def register(mcp: FastMCP, get_user_id, fs_factory, tier: str | None = None) -> None:
+    tier_desc = f"\n\n**STRICT BOUNDARY NOTICE**: This connector is strictly locked to {tier.upper()} only. Other tiers are completely inaccessible." if tier else ""
 
     @mcp.tool(
         name="read",
@@ -476,22 +477,49 @@ def register(mcp: FastMCP, get_user_id, fs_factory) -> None:
             "Set `include_images=true` to include embedded images (e.g. figures in PDFs, standalone image files). "
             "Off by default to save context — enable when you need to see charts, diagrams, or photos.\n\n"
             "When reading sources to compile wiki pages, note the filename and page ranges for citation."
+            + tier_desc
         ),
         structured_output=False,
     )
     async def read(
         ctx: Context,
-        knowledge_base: str,
         path: str,
+        knowledge_base: str = "mysecondbrain",
         pages: str = "",
         sections: list[str] | None = None,
         include_images: bool = False,
     ) -> str | list:
         user_id = get_user_id(ctx)
         fs = fs_factory(user_id)
+
+        if not knowledge_base:
+            kbs = await fs.list_knowledge_bases()
+            if kbs:
+                knowledge_base = kbs[0]["slug"]
+            else:
+                return "No knowledge base found."
+
         kb = await fs.resolve_kb(knowledge_base)
         if not kb:
-            return f"Knowledge base '{knowledge_base}' not found."
+            kbs = await fs.list_knowledge_bases()
+            if kbs:
+                kb = kbs[0]
+            else:
+                return f"Knowledge base '{knowledge_base}' not found."
+
+        if tier:
+            clean_path = path.lstrip("/").lower()
+            # If accessing a different tier, strictly deny
+            other_tiers = [t for t in ("tier1", "tier2", "tier3") if t != tier.lower()]
+            for ot in other_tiers:
+                if clean_path.startswith(ot):
+                    return f"Access Denied: This connector is strictly locked to {tier.upper()} only. Cannot access files from {ot.upper()}."
+
+            if not clean_path.startswith(tier.lower()):
+                if "*" in path or "?" in path:
+                    path = f"{tier}/*"
+                else:
+                    path = f"/{tier}/{path.lstrip('/')}"
 
         handler = ReadHandler(fs, kb)
         return await handler.read(path, pages, sections, include_images)

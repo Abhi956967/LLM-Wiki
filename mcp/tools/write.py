@@ -497,7 +497,7 @@ class WriteHandler:
         return len(lines) - 1
 
 
-def register(mcp: FastMCP, get_user_id, fs_factory) -> None:
+def register(mcp: FastMCP, get_user_id, fs_factory, tier: str | None = None) -> None:
 
     async def _resolve(ctx: Context, knowledge_base: str):
         user_id = get_user_id(ctx)

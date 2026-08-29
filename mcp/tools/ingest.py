@@ -15,7 +15,7 @@ def _bearer_token() -> str | None:
     return access_token.token if access_token else None
 
 
-def register(mcp: FastMCP, get_user_id, fs_factory) -> None:
+def register(mcp: FastMCP, get_user_id, fs_factory, tier: str | None = None) -> None:
 
     @mcp.tool(
         name="add_source_from_url",

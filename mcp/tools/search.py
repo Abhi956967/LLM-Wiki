@@ -284,7 +284,8 @@ async def _list_all_kbs(fs: VaultFS) -> str:
     return "\n".join(lines)
 
 
-def register(mcp: FastMCP, get_user_id, fs_factory) -> None:
+def register(mcp: FastMCP, get_user_id, fs_factory, tier: str | None = None) -> None:
+    tier_desc = f"\n\n**STRICT BOUNDARY NOTICE**: This connector is strictly locked to {tier.upper()} only. Other tiers are completely inaccessible." if tier else ""
 
     @mcp.tool(
         name="search",
@@ -302,11 +303,12 @@ def register(mcp: FastMCP, get_user_id, fs_factory) -> None:
             "- `search(mode=\"references\", query=\"stale\")` — pages flagged as potentially stale\n\n"
             "Use `path` to scope: `*` for root, `/wiki/**` for wiki only, `*.pdf` for PDFs, etc.\n"
             "Use `tags` to filter by document tags."
+            + tier_desc
         ),
     )
     async def search(
         ctx: Context,
-        knowledge_base: str,
+        knowledge_base: str = "mysecondbrain",
         mode: Literal["list", "search", "references"] = "list",
         query: str = "",
         path: str = "*",
@@ -319,19 +321,37 @@ def register(mcp: FastMCP, get_user_id, fs_factory) -> None:
         fs = fs_factory(user_id)
 
         if not knowledge_base:
-            return await _list_all_kbs(fs)
+            kbs = await fs.list_knowledge_bases()
+            if kbs:
+                knowledge_base = kbs[0]["slug"]
+            else:
+                return await _list_all_kbs(fs)
 
         kb = await fs.resolve_kb(knowledge_base)
         if not kb:
-            return f"Knowledge base '{knowledge_base}' not found."
+            kbs = await fs.list_knowledge_bases()
+            if kbs:
+                kb = kbs[0]
+            else:
+                return f"Knowledge base '{knowledge_base}' not found."
+
+        # Hard tier filter enforcement
+        if tier:
+            clean_path = path.lstrip("/").lower()
+            if not clean_path.startswith(tier.lower()):
+                path = f"{tier}/*"
 
         handler = SearchHandler(fs, kb)
 
         if mode == "list":
+            if tier and (path in ("*", "**", "/*", "**/*")):
+                path = f"{tier}/*"
             return await handler.list_documents(path, tags)
         elif mode == "search":
             if not query:
                 return "search mode requires a query."
+            if tier and (path in ("*", "**", "/*", "**/*")):
+                path = f"{tier}/*"
             return await handler.search_chunks(
                 query, path, tags, min(limit, MAX_SEARCH),
                 annotated_only=annotated_only, scope=scope,

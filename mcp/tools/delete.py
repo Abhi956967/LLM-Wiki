@@ -233,7 +233,7 @@ class DeleteHandler:
         return "\n".join(lines)
 
 
-def register(mcp: FastMCP, get_user_id, fs_factory) -> None:
+def register(mcp: FastMCP, get_user_id, fs_factory, tier: str | None = None) -> None:
 
     @mcp.tool(
         name="delete",

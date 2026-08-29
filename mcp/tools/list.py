@@ -5,7 +5,7 @@ from mcp.server.fastmcp import FastMCP, Context
 from config import settings
 
 
-def register(mcp: FastMCP, get_user_id, fs_factory) -> None:
+def register(mcp: FastMCP, get_user_id, fs_factory, tier: str | None = None) -> None:
 
     @mcp.tool(
         name="create_knowledge_base",

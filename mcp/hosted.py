@@ -111,11 +111,42 @@ def _fs_factory(user_id: str) -> PostgresVaultFS:
 
 
 register(mcp, _get_user_id, _fs_factory)
-# URL ingestion calls the hosted API; the local stdio server never registers it.
 register_ingest(mcp, _get_user_id, _fs_factory)
 
 
+def create_tier_mcp(tier: str, tier_title: str, tier_desc: str) -> FastMCP:
+    kwargs = dict(fastmcp_kwargs)
+    kwargs["name"] = f"My Second Brain - {tier_title}"
+    kwargs["instructions"] = (
+        f"You are connected strictly to {tier_title}. "
+        f"{tier_desc}. "
+        f"You can only search and read documents in {tier}. Access to other tiers is completely restricted."
+    )
+    tier_mcp = FastMCP(**kwargs)
+    register(tier_mcp, _get_user_id, _fs_factory, tier=tier)
+    register_ingest(tier_mcp, _get_user_id, _fs_factory, tier=tier)
+    return tier_mcp
+
+
+mcp_tier1 = create_tier_mcp(
+    "tier1",
+    "Tier 1 (Core Foundations)",
+    "Contains Core Foundations, Computer Science basics, Algorithms, OS, Networking, and Databases",
+)
+mcp_tier2 = create_tier_mcp(
+    "tier2",
+    "Tier 2 (Applied Systems)",
+    "Contains Applied Architecture, Microservices, Cloud, Distributed Systems, Kafka, K8s, RAG",
+)
+mcp_tier3 = create_tier_mcp(
+    "tier3",
+    "Tier 3 (Deep Internals)",
+    "Contains Deep Internals, FlashAttention, eBPF, LSM Trees, Consensus, Compiler internals",
+)
+
+
 from starlette.responses import JSONResponse, PlainTextResponse
+from starlette.routing import Mount
 
 async def health(request):
     return PlainTextResponse("OK")
@@ -125,7 +156,12 @@ async def root_info(request):
     return JSONResponse({
         "name": "LLM Wiki MCP Server",
         "status": "online",
-        "mcp_endpoint": settings.MCP_URL or "/mcp",
+        "mcp_endpoints": {
+            "all": "/mcp",
+            "tier1": "/mcp/tier1",
+            "tier2": "/mcp/tier2",
+            "tier3": "/mcp/tier3"
+        },
         "health": "/health",
         "database": "PostgreSQL (Connected)"
     })
@@ -150,11 +186,18 @@ def _root_protected_resource_route() -> Route:
     )
 
 
+app_t1 = mcp_tier1.streamable_http_app()
+app_t2 = mcp_tier2.streamable_http_app()
+app_t3 = mcp_tier3.streamable_http_app()
+
 base_app = mcp.streamable_http_app()
 base_app.router.routes.insert(0, Route("/", root_info))
 base_app.router.routes.insert(1, Route("/health", health))
+base_app.router.routes.insert(2, Mount("/mcp/tier1", app=app_t1))
+base_app.router.routes.insert(3, Mount("/mcp/tier2", app=app_t2))
+base_app.router.routes.insert(4, Mount("/mcp/tier3", app=app_t3))
 if ENABLE_OAUTH:
-    base_app.router.routes.insert(2, _root_protected_resource_route())
+    base_app.router.routes.insert(5, _root_protected_resource_route())
 
 
 class AcceptHeaderMiddleware:

@@ -516,7 +516,7 @@ Before finalizing, audit the lesson for: a meaningful outcome, a sustained case,
 """
 
 
-def register(mcp: FastMCP, get_user_id, fs_factory) -> None:
+def register(mcp: FastMCP, get_user_id, fs_factory, tier: str | None = None) -> None:
 
     @mcp.tool(
         name="guide",
@@ -526,10 +526,11 @@ def register(mcp: FastMCP, get_user_id, fs_factory) -> None:
         user_id = get_user_id(ctx)
         fs = fs_factory(user_id)
         kbs = await fs.list_knowledge_bases()
+        tier_notice = f"\n\n### 🔒 Active Connector Scope: {tier.upper()}\nThis connector is strictly scoped to **{tier.upper()}**. Queries made through this tool will never access other tiers." if tier else ""
         if not kbs:
-            return GUIDE_TEXT + "No knowledge bases yet. Use `create_knowledge_base`, or create one at " + settings.APP_URL + "/wikis"
+            return GUIDE_TEXT + tier_notice + "\n\nNo knowledge bases yet. Use `create_knowledge_base`, or create one at " + settings.APP_URL + "/wikis"
 
         lines = []
         for kb in kbs:
             lines.append(f"- **{kb['name']}** (`{kb['slug']}`)")
-        return GUIDE_TEXT + "\n".join(lines)
+        return GUIDE_TEXT + tier_notice + "\n\n" + "\n".join(lines)

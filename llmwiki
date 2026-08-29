@@ -285,7 +285,7 @@ def cmd_open(workspace: str) -> None:
     cmd_serve(str(ws), open_browser=True)
 
 
-def cmd_mcp(workspace: str) -> None:
+def cmd_mcp(workspace: str, tier: str | None = None) -> None:
     ws = Path(workspace).resolve()
     if not (ws / ".llmwiki" / "index.db").exists():
         cmd_init(str(ws))
@@ -297,30 +297,48 @@ def cmd_mcp(workspace: str) -> None:
     # Claude Desktop's stdio lifecycle — spawn and wait there instead.
     os.chdir(str(MCP_DIR))
     cmd = [sys.executable, "-m", "local_server", "--workspace", str(ws)]
+    if tier:
+        cmd.extend(["--tier", tier])
     if sys.platform == "win32":
         sys.exit(subprocess.call(cmd))
     os.execvp(sys.executable, cmd)
 
 
-def cmd_mcp_config(workspace: str, name: str | None = None) -> None:
+def cmd_mcp_config(workspace: str, name: str | None = None, tier: str | None = None) -> None:
     ws = Path(workspace).resolve()
-    server_name = name or f"llmwiki-{_sanitize_name(ws.name)}"
     llmwiki_path = str(REPO_ROOT / "llmwiki")
 
-    # Launch via the current interpreter: shebangs don't work on Windows, and
-    # this pins the venv python (Claude Desktop won't have it activated).
-    config = {
-        "mcpServers": {
-            server_name: {
-                "command": sys.executable,
-                "args": [llmwiki_path, "mcp", str(ws)],
+    if tier:
+        server_name = name or f"llmwiki-{_sanitize_name(ws.name)}-{tier}"
+        config = {
+            "mcpServers": {
+                server_name: {
+                    "command": sys.executable,
+                    "args": [llmwiki_path, "mcp", str(ws), "--tier", tier],
+                }
             }
         }
-    }
+    else:
+        server_name = name or f"llmwiki-{_sanitize_name(ws.name)}"
+        config = {
+            "mcpServers": {
+                f"{server_name}-tier1": {
+                    "command": sys.executable,
+                    "args": [llmwiki_path, "mcp", str(ws), "--tier", "tier1"],
+                },
+                f"{server_name}-tier2": {
+                    "command": sys.executable,
+                    "args": [llmwiki_path, "mcp", str(ws), "--tier", "tier2"],
+                },
+                f"{server_name}-tier3": {
+                    "command": sys.executable,
+                    "args": [llmwiki_path, "mcp", str(ws), "--tier", "tier3"],
+                },
+            }
+        }
 
     print(f"# Add to claude_desktop_config.json:")
-    print(f"# This MCP server is scoped to: {ws}")
-    print(f"# To use another workspace, add another server entry.")
+    print(f"# Scoped to: {ws}")
     print()
     print(json.dumps(config, indent=2))
 
@@ -371,10 +389,12 @@ def main():
 
     p_mcp = sub.add_parser("mcp", help="Run stdio MCP server")
     p_mcp.add_argument("workspace", help="Path to workspace folder")
+    p_mcp.add_argument("--tier", help="Scope to tier (tier1, tier2, tier3)")
 
     p_config = sub.add_parser("mcp-config", help="Print Claude MCP config snippet")
     p_config.add_argument("workspace", help="Path to workspace folder")
     p_config.add_argument("--name", help="Custom server name")
+    p_config.add_argument("--tier", help="Specific tier (tier1, tier2, tier3)")
 
     p_reindex = sub.add_parser("reindex", help="Force full rebuild of index")
     p_reindex.add_argument("workspace", help="Path to workspace folder")
@@ -392,9 +412,9 @@ def main():
     elif args.command == "serve":
         cmd_serve(args.workspace)
     elif args.command == "mcp":
-        cmd_mcp(args.workspace)
+        cmd_mcp(args.workspace, args.tier)
     elif args.command == "mcp-config":
-        cmd_mcp_config(args.workspace, args.name)
+        cmd_mcp_config(args.workspace, args.name, args.tier)
     elif args.command == "reindex":
         cmd_reindex(args.workspace)
 

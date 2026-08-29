@@ -98,7 +98,7 @@ def _anchor_text(highlight: dict) -> str:
     return ""
 
 
-def register(mcp: FastMCP, get_user_id, fs_factory) -> None:
+def register(mcp: FastMCP, get_user_id, fs_factory, tier: str | None = None) -> None:
 
     @mcp.tool(
         name="reply_to_comment",
