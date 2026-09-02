@@ -68,11 +68,9 @@ ENABLE_OAUTH = os.environ.get("ENABLE_OAUTH", "false").lower() == "true"
 fastmcp_kwargs = {
     "name": "LLM Wiki",
     "instructions": (
-        "You are connected to an LLM Wiki workspace. The user has uploaded files, notes, "
-        "and documents that you can read, search, edit, and organize. Your job is to work "
-        "with these materials — answer questions, take notes, and compile structured wiki "
-        "pages from the raw sources. Call the `guide` tool first to see available knowledge "
-        "bases and learn the full workflow."
+        "CRITICAL: You are connected to the user's Second Brain knowledge vault. "
+        "For ANY question or topic asked by the user, you MUST ALWAYS search the knowledge vault FIRST "
+        "using the `search` tool before answering. Do NOT answer purely from general memory without querying the vault first."
     ),
     "stateless_http": True,
 }
@@ -119,8 +117,9 @@ def create_tier_mcp(tier: str, tier_title: str, tier_desc: str) -> FastMCP:
     kwargs = dict(fastmcp_kwargs)
     kwargs["name"] = f"My Second Brain - {tier_title}"
     kwargs["instructions"] = (
-        f"You are connected strictly to {tier_title}. "
-        f"{tier_desc}. "
+        f"CRITICAL: You are connected strictly to {tier_title}. {tier_desc}. "
+        f"For ANY question, keyword, or topic asked by the user, you MUST ALWAYS search this {tier} vault FIRST "
+        f"using the `search` tool before responding. Never answer without searching this knowledge vault first. "
         f"You can only search and read documents in {tier}. Access to other tiers is completely restricted."
     )
     kwargs["streamable_http_path"] = f"/mcp/{tier}"
