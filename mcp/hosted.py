@@ -93,6 +93,7 @@ else:
         allowed_hosts=["*"],
     )
 
+fastmcp_kwargs["streamable_http_path"] = "/mcp"
 mcp = FastMCP(**fastmcp_kwargs)
 
 def _get_user_id(ctx):
@@ -122,6 +123,7 @@ def create_tier_mcp(tier: str, tier_title: str, tier_desc: str) -> FastMCP:
         f"{tier_desc}. "
         f"You can only search and read documents in {tier}. Access to other tiers is completely restricted."
     )
+    kwargs["streamable_http_path"] = f"/mcp/{tier}"
     tier_mcp = FastMCP(**kwargs)
     register(tier_mcp, _get_user_id, _fs_factory, tier=tier)
     register_ingest(tier_mcp, _get_user_id, _fs_factory, tier=tier)
@@ -145,8 +147,9 @@ mcp_tier3 = create_tier_mcp(
 )
 
 
+from contextlib import asynccontextmanager
+from starlette.applications import Starlette
 from starlette.responses import JSONResponse, PlainTextResponse
-from starlette.routing import Mount
 
 async def health(request):
     return PlainTextResponse("OK")
@@ -186,18 +189,33 @@ def _root_protected_resource_route() -> Route:
     )
 
 
+app_main = mcp.streamable_http_app()
 app_t1 = mcp_tier1.streamable_http_app()
 app_t2 = mcp_tier2.streamable_http_app()
 app_t3 = mcp_tier3.streamable_http_app()
 
-base_app = mcp.streamable_http_app()
-base_app.router.routes.insert(0, Route("/", root_info))
-base_app.router.routes.insert(1, Route("/health", health))
-base_app.router.routes.insert(2, Mount("/mcp/tier1", app=app_t1))
-base_app.router.routes.insert(3, Mount("/mcp/tier2", app=app_t2))
-base_app.router.routes.insert(4, Mount("/mcp/tier3", app=app_t3))
+@asynccontextmanager
+async def lifespan(application):
+    async with mcp.session_manager.run(), \
+               mcp_tier1.session_manager.run(), \
+               mcp_tier2.session_manager.run(), \
+               mcp_tier3.session_manager.run():
+        yield
+
+all_routes = [
+    Route("/", root_info),
+    Route("/health", health),
+]
 if ENABLE_OAUTH:
-    base_app.router.routes.insert(5, _root_protected_resource_route())
+    all_routes.append(_root_protected_resource_route())
+
+all_routes += list(app_main.routes) + list(app_t1.routes) + list(app_t2.routes) + list(app_t3.routes)
+
+base_app = Starlette(
+    debug=True,
+    routes=all_routes,
+    lifespan=lifespan
+)
 
 
 class AcceptHeaderMiddleware:
