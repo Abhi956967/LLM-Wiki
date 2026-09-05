@@ -64,7 +64,9 @@ class SupabaseTokenVerifier(TokenVerifier):
         logger.info("MCP auth: %s", sub)
         return AccessToken(
             token=token,
-            client_id=sub,
+            client_id=payload.get("client_id") or sub,
+            subject=sub,
             scopes=scopes,
-            extra={"claims": payload},
+            expires_at=payload.get("exp"),
+            claims=payload,
         )
