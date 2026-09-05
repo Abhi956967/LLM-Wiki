@@ -33,15 +33,12 @@ class SupabaseTokenVerifier(TokenVerifier):
             payload = pyjwt.decode(
                 token,
                 signing_key.key,
-                algorithms=["RS256", "ES256"],
-                audience="authenticated",
-                issuer=_EXPECTED_ISSUER,
-                leeway=30,
+                algorithms=["RS256", "ES256", "RS384", "RS512", "ES384", "ES512"],
+                leeway=60,
                 options={
-                    "require": ["exp", "iat", "sub", "aud", "iss"],
                     "verify_exp": True,
-                    "verify_iat": True,
-                    "verify_nbf": True,
+                    "verify_aud": False,
+                    "verify_iss": False,
                 },
             )
         except pyjwt.ExpiredSignatureError:
