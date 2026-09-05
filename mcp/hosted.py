@@ -126,6 +126,12 @@ def create_tier_mcp(tier: str, tier_title: str, tier_desc: str) -> FastMCP:
         f"You can only search and read documents in {tier}. Access to other tiers is completely restricted."
     )
     kwargs["streamable_http_path"] = f"/mcp/{tier}"
+    if ENABLE_OAUTH and settings.SUPABASE_URL and settings.MCP_URL:
+        tier_url = f"{settings.MCP_URL.rstrip('/')}/{tier}"
+        kwargs["auth"] = AuthSettings(
+            issuer_url=AnyHttpUrl(f"{settings.SUPABASE_URL}/auth/v1"),
+            resource_server_url=AnyHttpUrl(tier_url),
+        )
     tier_mcp = FastMCP(**kwargs)
     register(tier_mcp, _get_user_id, _fs_factory, tier=tier)
     register_ingest(tier_mcp, _get_user_id, _fs_factory, tier=tier)
