@@ -3,6 +3,9 @@
 import importlib.util
 import os
 from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import logfire
 import sentry_sdk
@@ -63,7 +66,7 @@ def _build_allowed_hosts(mcp_url: str) -> list[str]:
     return [host, f"{host}:*"]
 
 
-ENABLE_OAUTH = os.environ.get("ENABLE_OAUTH", "false").lower() == "true"
+ENABLE_OAUTH = bool(settings.ENABLE_OAUTH) or (os.environ.get("ENABLE_OAUTH", "false").lower() == "true")
 
 fastmcp_kwargs = {
     "name": "LLM Wiki",

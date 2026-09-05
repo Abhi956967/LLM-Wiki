@@ -21,3 +21,5 @@ services:
         sync: false
       - key: MCP_URL
         sync: false
+      - key: ENABLE_OAUTH
+        value: "true"

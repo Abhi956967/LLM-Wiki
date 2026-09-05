@@ -10,6 +10,7 @@ class Settings(BaseSettings):
 
     MODE: str = "local"  # "local" or "hosted"
     WORKSPACE_PATH: str = "."
+    ENABLE_OAUTH: bool = False
 
     DATABASE_URL: str = ""
     SUPABASE_URL: str = ""

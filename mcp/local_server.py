@@ -110,7 +110,7 @@ def main():
         return "pong"
 
     logger.info("Local MCP server ready — workspace: %s", workspace)
-    asyncio.run(mcp.run_stdio_async())
+    mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":
