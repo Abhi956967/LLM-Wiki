@@ -15,12 +15,10 @@ _jwks_client: PyJWKClient | None = None
 def _get_jwks_client() -> PyJWKClient:
     global _jwks_client
     if _jwks_client is None:
-        jwks_url = f"{settings.SUPABASE_URL}/auth/v1/.well-known/jwks.json"
+        base = (settings.SUPABASE_URL or "https://dnouksmjstladcpjpyok.supabase.co").rstrip('/')
+        jwks_url = f"{base}/auth/v1/.well-known/jwks.json"
         _jwks_client = PyJWKClient(jwks_url)
     return _jwks_client
-
-
-_EXPECTED_ISSUER = f"{settings.SUPABASE_URL.rstrip('/')}/auth/v1"
 
 
 class SupabaseTokenVerifier(TokenVerifier):
@@ -65,7 +63,8 @@ class SupabaseTokenVerifier(TokenVerifier):
 
         # 2. Universal Supabase Auth API Fallback (Checks OAuth userinfo and session user endpoints)
         try:
-            import requests
+            import json
+            import urllib.request
 
             def _check_supabase_api():
                 anon_key = getattr(settings, "SUPABASE_ANON_KEY", "") or "sb_publishable_pIt3iceJ0m9fsStpt6j5ig_LO4wobG8"
@@ -73,26 +72,21 @@ class SupabaseTokenVerifier(TokenVerifier):
                     "Authorization": f"Bearer {token}",
                     "apikey": anon_key,
                 }
-                base = settings.SUPABASE_URL.rstrip('/')
+                base = (settings.SUPABASE_URL or "https://dnouksmjstladcpjpyok.supabase.co").rstrip('/')
                 
-                # Check OAuth 2.0 UserInfo endpoint (for tokens issued by Supabase OAuth Server)
-                try:
-                    r1 = requests.get(f"{base}/auth/v1/oauth/userinfo", headers=headers, timeout=6)
-                    if r1.status_code == 200:
-                        return r1
-                except Exception:
-                    pass
+                # Check OAuth 2.0 UserInfo endpoint
+                for endpoint in ["/auth/v1/oauth/userinfo", "/auth/v1/user"]:
+                    try:
+                        req = urllib.request.Request(f"{base}{endpoint}", headers=headers)
+                        with urllib.request.urlopen(req, timeout=6) as resp:
+                            if resp.status == 200:
+                                return json.loads(resp.read().decode())
+                    except Exception:
+                        pass
+                return None
 
-                # Check standard Supabase /user endpoint
-                try:
-                    r2 = requests.get(f"{base}/auth/v1/user", headers=headers, timeout=6)
-                    return r2
-                except Exception as ex:
-                    return None
-
-            res = await asyncio.to_thread(_check_supabase_api)
-            if res and res.status_code == 200:
-                user_data = res.json()
+            user_data = await asyncio.to_thread(_check_supabase_api)
+            if user_data:
                 user_id = user_data.get("sub") or user_data.get("id") or ""
                 if user_id:
                     logger.info("MCP auth verified via Supabase Auth API: %s", user_id)
@@ -103,9 +97,9 @@ class SupabaseTokenVerifier(TokenVerifier):
                         scopes=[],
                         claims=user_data,
                     )
-            elif res:
-                logger.warning("Supabase Auth API rejected token: status %d %s", res.status_code, res.text[:200])
+            else:
+                logger.warning("Supabase Auth API fallback: token could not be verified")
         except Exception as e:
-            logger.warning("Supabase Auth API fallback failed: %s", e)
+            logger.warning("Supabase Auth API fallback error: %s", e)
 
         return None

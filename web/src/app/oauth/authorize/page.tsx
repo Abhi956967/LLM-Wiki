@@ -13,7 +13,7 @@ interface AuthorizationDetails {
 }
 
 interface OAuthDecisionResult {
-  data?: { redirect_to?: string; redirect_uri?: string; url?: string } | null
+  data?: { redirect_url?: string; redirect_to?: string; redirect_uri?: string; url?: string } | null
   error?: { message?: string } | null
 }
 
@@ -25,8 +25,10 @@ interface OAuthDetailsResult {
 interface OAuthAuthClient {
   oauth: {
     getAuthorizationDetails: (id: string) => Promise<OAuthDetailsResult>
-    approveAuthorization: (id: string) => Promise<OAuthDecisionResult>
-    denyAuthorization: (id: string) => Promise<OAuthDecisionResult>
+    approveAuthorization: (id: string, options?: { skipBrowserRedirect?: boolean }) => Promise<OAuthDecisionResult>
+    denyAuthorization: (id: string, options?: { skipBrowserRedirect?: boolean }) => Promise<OAuthDecisionResult>
+    listOAuthGrants?: () => Promise<{ data?: Array<{ client?: { id?: string } }> | null; error?: unknown }>
+    revokeOAuthGrant?: (options: { clientId: string }) => Promise<{ error?: unknown }>
   }
 }
 
@@ -76,9 +78,27 @@ function OAuthConsentContent() {
     try {
       const supabase = createClient()
       const auth = supabase.auth as unknown as OAuthAuthClient
-      const result = await auth.oauth.approveAuthorization(authorizationId)
-      if (result.error) throw result.error
-      const redirectUrl = result.data?.redirect_to || result.data?.redirect_uri || result.data?.url
+      let result = await auth.oauth.approveAuthorization(authorizationId)
+      if (result.error) {
+        if (typeof result.error.message === 'string' && result.error.message.includes('no longer pending')) {
+          try {
+            if (auth.oauth.listOAuthGrants && auth.oauth.revokeOAuthGrant) {
+              const { data: grants } = await auth.oauth.listOAuthGrants()
+              if (grants && grants.length > 0) {
+                for (const g of grants) {
+                  if (g.client?.id) {
+                    await auth.oauth.revokeOAuthGrant({ clientId: g.client.id })
+                  }
+                }
+              }
+            }
+          } catch (e) {
+            console.warn('Could not revoke stale grants:', e)
+          }
+        }
+        throw result.error
+      }
+      const redirectUrl = result.data?.redirect_url || result.data?.redirect_to || result.data?.redirect_uri || result.data?.url
       if (redirectUrl) {
         window.location.href = redirectUrl
       } else {
@@ -100,7 +120,7 @@ function OAuthConsentContent() {
       const auth = supabase.auth as unknown as OAuthAuthClient
       const result = await auth.oauth.denyAuthorization(authorizationId)
       if (result.error) throw result.error
-      const redirectUrl = result.data?.redirect_to || result.data?.redirect_uri || result.data?.url
+      const redirectUrl = result.data?.redirect_url || result.data?.redirect_to || result.data?.redirect_uri || result.data?.url
       if (redirectUrl) {
         window.location.href = redirectUrl
       } else {

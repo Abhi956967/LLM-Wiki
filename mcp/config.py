@@ -10,10 +10,10 @@ class Settings(BaseSettings):
 
     MODE: str = "local"  # "local" or "hosted"
     WORKSPACE_PATH: str = "."
-    ENABLE_OAUTH: bool = False
+    ENABLE_OAUTH: bool = True
 
     DATABASE_URL: str = ""
-    SUPABASE_URL: str = ""
+    SUPABASE_URL: str = "https://dnouksmjstladcpjpyok.supabase.co"
     SUPABASE_ANON_KEY: str = "sb_publishable_pIt3iceJ0m9fsStpt6j5ig_LO4wobG8"
     VOYAGE_API_KEY: str = ""
     TURBOPUFFER_API_KEY: str = ""
@@ -25,10 +25,10 @@ class Settings(BaseSettings):
     S3_BUCKET: str = "supavault-documents"
     QUOTA_MAX_STORAGE_BYTES: int = 1_073_741_824
     LOGFIRE_TOKEN: str = ""
-    STAGE: str = "dev"
+    STAGE: str = "production"
     APP_URL: str = "http://localhost:3000"
     API_URL: str = "http://localhost:8000"
-    MCP_URL: str = "http://localhost:8080/mcp"
+    MCP_URL: str = "https://llmwiki-mcp-server.onrender.com/mcp"
     SENTRY_DSN: str = ""
 
 
