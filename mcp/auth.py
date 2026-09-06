@@ -46,12 +46,13 @@ class SupabaseTokenVerifier(TokenVerifier):
                 scope_str = payload.get("scope", "")
                 if isinstance(scope_str, str) and scope_str:
                     scopes = scope_str.split()
-                logger.info("MCP auth verified via JWKS: %s", sub)
+                resource_url = str(settings.MCP_URL or "https://llmwiki-mcp-server.onrender.com/mcp")
                 return AccessToken(
                     token=token,
                     client_id=payload.get("client_id") or sub,
                     subject=sub,
-                    scopes=scopes,
+                    scopes=scopes if scopes else ["read", "write"],
+                    resource=resource_url,
                     expires_at=payload.get("exp"),
                     claims=payload,
                 )
@@ -90,11 +91,13 @@ class SupabaseTokenVerifier(TokenVerifier):
                 user_id = user_data.get("sub") or user_data.get("id") or ""
                 if user_id:
                     logger.info("MCP auth verified via Supabase Auth API: %s", user_id)
+                    resource_url = str(settings.MCP_URL or "https://llmwiki-mcp-server.onrender.com/mcp")
                     return AccessToken(
                         token=token,
                         client_id=user_id,
                         subject=user_id,
-                        scopes=[],
+                        scopes=["read", "write"],
+                        resource=resource_url,
                         claims=user_data,
                     )
             else:
