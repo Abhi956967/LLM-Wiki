@@ -178,6 +178,26 @@ async def root_info(request):
     })
 
 
+async def oauth_auth_server_metadata(request):
+    base_supabase = settings.SUPABASE_URL or "https://dnouksmjstladcpjpyok.supabase.co"
+    return JSONResponse({
+        "issuer": f"{base_supabase}/auth/v1",
+        "authorization_endpoint": f"{base_supabase}/auth/v1/oauth/authorize",
+        "token_endpoint": f"{base_supabase}/auth/v1/oauth/token",
+        "jwks_uri": f"{base_supabase}/auth/v1/.well-known/jwks.json",
+        "userinfo_endpoint": f"{base_supabase}/auth/v1/oauth/userinfo",
+        "registration_endpoint": f"{base_supabase}/auth/v1/oauth/clients/register",
+        "scopes_supported": ["openid", "profile", "email", "phone", "offline_access"],
+        "response_types_supported": ["code"],
+        "response_modes_supported": ["query"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "subject_types_supported": ["public"],
+        "id_token_signing_alg_values_supported": ["RS256", "HS256", "ES256"],
+        "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post", "none"],
+        "code_challenge_methods_supported": ["S256", "plain"]
+    })
+
+
 def _root_protected_resource_route() -> Route:
     from mcp.server.auth.handlers.metadata import ProtectedResourceMetadataHandler
     from mcp.server.auth.routes import cors_middleware
@@ -211,6 +231,8 @@ async def lifespan(application):
 all_routes = [
     Route("/", root_info, methods=["GET"]),
     Route("/health", health, methods=["GET"]),
+    Route("/.well-known/oauth-authorization-server", oauth_auth_server_metadata, methods=["GET", "OPTIONS"]),
+    Route("/.well-known/openid-configuration", oauth_auth_server_metadata, methods=["GET", "OPTIONS"]),
 ]
 if ENABLE_OAUTH:
     all_routes.append(_root_protected_resource_route())
