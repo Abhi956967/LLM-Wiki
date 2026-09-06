@@ -14,6 +14,7 @@ class Settings(BaseSettings):
 
     DATABASE_URL: str = ""
     SUPABASE_URL: str = ""
+    SUPABASE_ANON_KEY: str = "sb_publishable_pIt3iceJ0m9fsStpt6j5ig_LO4wobG8"
     VOYAGE_API_KEY: str = ""
     TURBOPUFFER_API_KEY: str = ""
     EMBEDDING_MODEL: str = "voyage-4-lite"

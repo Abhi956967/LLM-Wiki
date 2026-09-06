@@ -26,6 +26,7 @@ _EXPECTED_ISSUER = f"{settings.SUPABASE_URL.rstrip('/')}/auth/v1"
 class SupabaseTokenVerifier(TokenVerifier):
 
     async def verify_token(self, token: str) -> AccessToken | None:
+        # 1. Try local JWKS verification
         try:
             signing_key = await asyncio.to_thread(
                 _get_jwks_client().get_signing_key_from_jwt, token
@@ -41,32 +42,55 @@ class SupabaseTokenVerifier(TokenVerifier):
                     "verify_iss": False,
                 },
             )
+            sub = payload.get("sub", "") or payload.get("user_id", "")
+            if sub:
+                scopes = []
+                scope_str = payload.get("scope", "")
+                if isinstance(scope_str, str) and scope_str:
+                    scopes = scope_str.split()
+                logger.info("MCP auth verified via JWKS: %s", sub)
+                return AccessToken(
+                    token=token,
+                    client_id=payload.get("client_id") or sub,
+                    subject=sub,
+                    scopes=scopes,
+                    expires_at=payload.get("exp"),
+                    claims=payload,
+                )
         except pyjwt.ExpiredSignatureError:
             logger.info("MCP auth rejected: token expired")
             return None
-        except pyjwt.PyJWTError as e:
-            logger.info("MCP auth rejected: %s: %s", type(e).__name__, e)
-            return None
         except Exception as e:
-            logger.warning("MCP auth rejected: JWKS fetch failed: %s", e)
-            return None
+            logger.info("JWKS verification attempt: %s (%s). Trying Supabase Auth API fallback...", type(e).__name__, e)
 
-        sub = payload.get("sub", "")
-        if not sub:
-            logger.warning("JWT has no sub claim")
-            return None
+        # 2. Universal Supabase Auth API Fallback (Verifies ANY valid OAuth / Session Token directly)
+        try:
+            import httpx
+            anon_key = getattr(settings, "SUPABASE_ANON_KEY", "") or "sb_publishable_pIt3iceJ0m9fsStpt6j5ig_LO4wobG8"
+            url = f"{settings.SUPABASE_URL.rstrip('/')}/auth/v1/user"
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                res = await client.get(
+                    url,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "apikey": anon_key,
+                    },
+                )
+                if res.status_code == 200:
+                    user_data = res.json()
+                    user_id = user_data.get("id") or user_data.get("sub") or ""
+                    if user_id:
+                        logger.info("MCP auth verified via Supabase Auth API: %s", user_id)
+                        return AccessToken(
+                            token=token,
+                            client_id=user_id,
+                            subject=user_id,
+                            scopes=[],
+                            claims=user_data,
+                        )
+                else:
+                    logger.warning("Supabase Auth API rejected token: status %d %s", res.status_code, res.text[:200])
+        except Exception as e:
+            logger.warning("Supabase Auth API fallback failed: %s", e)
 
-        scopes = []
-        scope_str = payload.get("scope", "")
-        if isinstance(scope_str, str) and scope_str:
-            scopes = scope_str.split()
-
-        logger.info("MCP auth: %s", sub)
-        return AccessToken(
-            token=token,
-            client_id=payload.get("client_id") or sub,
-            subject=sub,
-            scopes=scopes,
-            expires_at=payload.get("exp"),
-            claims=payload,
-        )
+        return None
