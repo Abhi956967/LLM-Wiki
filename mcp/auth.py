@@ -63,26 +63,37 @@ class SupabaseTokenVerifier(TokenVerifier):
         except Exception as e:
             logger.info("JWKS verification attempt: %s (%s). Trying Supabase Auth API fallback...", type(e).__name__, e)
 
-        # 2. Universal Supabase Auth API Fallback (Verifies ANY valid OAuth / Session Token directly)
+        # 2. Universal Supabase Auth API Fallback (Checks OAuth userinfo and session user endpoints)
         try:
             import requests
 
             def _check_supabase_api():
                 anon_key = getattr(settings, "SUPABASE_ANON_KEY", "") or "sb_publishable_pIt3iceJ0m9fsStpt6j5ig_LO4wobG8"
-                url = f"{settings.SUPABASE_URL.rstrip('/')}/auth/v1/user"
-                return requests.get(
-                    url,
-                    headers={
-                        "Authorization": f"Bearer {token}",
-                        "apikey": anon_key,
-                    },
-                    timeout=8,
-                )
+                headers = {
+                    "Authorization": f"Bearer {token}",
+                    "apikey": anon_key,
+                }
+                base = settings.SUPABASE_URL.rstrip('/')
+                
+                # Check OAuth 2.0 UserInfo endpoint (for tokens issued by Supabase OAuth Server)
+                try:
+                    r1 = requests.get(f"{base}/auth/v1/oauth/userinfo", headers=headers, timeout=6)
+                    if r1.status_code == 200:
+                        return r1
+                except Exception:
+                    pass
+
+                # Check standard Supabase /user endpoint
+                try:
+                    r2 = requests.get(f"{base}/auth/v1/user", headers=headers, timeout=6)
+                    return r2
+                except Exception as ex:
+                    return None
 
             res = await asyncio.to_thread(_check_supabase_api)
-            if res.status_code == 200:
+            if res and res.status_code == 200:
                 user_data = res.json()
-                user_id = user_data.get("id") or user_data.get("sub") or ""
+                user_id = user_data.get("sub") or user_data.get("id") or ""
                 if user_id:
                     logger.info("MCP auth verified via Supabase Auth API: %s", user_id)
                     return AccessToken(
@@ -92,7 +103,7 @@ class SupabaseTokenVerifier(TokenVerifier):
                         scopes=[],
                         claims=user_data,
                     )
-            else:
+            elif res:
                 logger.warning("Supabase Auth API rejected token: status %d %s", res.status_code, res.text[:200])
         except Exception as e:
             logger.warning("Supabase Auth API fallback failed: %s", e)
