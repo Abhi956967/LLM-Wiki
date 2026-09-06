@@ -216,34 +216,20 @@ def _root_protected_resource_route() -> Route:
 
 
 app_main = mcp.streamable_http_app()
-app_t1 = mcp_tier1.streamable_http_app()
-app_t2 = mcp_tier2.streamable_http_app()
-app_t3 = mcp_tier3.streamable_http_app()
+
+app_main.routes.insert(0, Route("/", root_info, methods=["GET"]))
+app_main.routes.insert(1, Route("/health", health, methods=["GET"]))
+app_main.routes.insert(2, Route("/.well-known/oauth-authorization-server", oauth_auth_server_metadata, methods=["GET", "OPTIONS"]))
+app_main.routes.insert(3, Route("/.well-known/openid-configuration", oauth_auth_server_metadata, methods=["GET", "OPTIONS"]))
+if ENABLE_OAUTH:
+    app_main.routes.insert(4, _root_protected_resource_route())
 
 @asynccontextmanager
 async def lifespan(application):
-    async with mcp.session_manager.run(), \
-               mcp_tier1.session_manager.run(), \
-               mcp_tier2.session_manager.run(), \
-               mcp_tier3.session_manager.run():
+    async with mcp.session_manager.run():
         yield
 
-all_routes = [
-    Route("/", root_info, methods=["GET"]),
-    Route("/health", health, methods=["GET"]),
-    Route("/.well-known/oauth-authorization-server", oauth_auth_server_metadata, methods=["GET", "OPTIONS"]),
-    Route("/.well-known/openid-configuration", oauth_auth_server_metadata, methods=["GET", "OPTIONS"]),
-]
-if ENABLE_OAUTH:
-    all_routes.append(_root_protected_resource_route())
-
-all_routes += list(app_main.routes) + list(app_t1.routes) + list(app_t2.routes) + list(app_t3.routes)
-
-base_app = Starlette(
-    debug=True,
-    routes=all_routes,
-    lifespan=lifespan
-)
+app_main.router.lifespan_context = lifespan
 
 
 class AcceptHeaderMiddleware:
@@ -270,7 +256,7 @@ class AcceptHeaderMiddleware:
         await self.app(scope, receive, send)
 
 
-app = AcceptHeaderMiddleware(base_app)
+app = AcceptHeaderMiddleware(app_main)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
