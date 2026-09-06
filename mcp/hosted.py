@@ -125,7 +125,7 @@ def create_tier_mcp(tier: str, tier_title: str, tier_desc: str) -> FastMCP:
         f"using the `search` tool before responding. Never answer without searching this knowledge vault first. "
         f"You can only search and read documents in {tier}. Access to other tiers is completely restricted."
     )
-    kwargs["streamable_http_path"] = ""
+    kwargs["streamable_http_path"] = f"/mcp/{tier}"
     if ENABLE_OAUTH and settings.SUPABASE_URL and settings.MCP_URL:
         tier_url = f"{settings.MCP_URL.rstrip('/')}/{tier}"
         kwargs["auth"] = AuthSettings(
@@ -200,15 +200,6 @@ app_t1 = mcp_tier1.streamable_http_app()
 app_t2 = mcp_tier2.streamable_http_app()
 app_t3 = mcp_tier3.streamable_http_app()
 
-app_main.routes.insert(0, Route("/", root_info, methods=["GET"]))
-app_main.routes.insert(1, Route("/health", health, methods=["GET"]))
-if ENABLE_OAUTH:
-    app_main.routes.insert(2, _root_protected_resource_route())
-
-app_main.mount("/mcp/tier1", app_t1)
-app_main.mount("/mcp/tier2", app_t2)
-app_main.mount("/mcp/tier3", app_t3)
-
 @asynccontextmanager
 async def lifespan(application):
     async with mcp.session_manager.run(), \
@@ -217,7 +208,20 @@ async def lifespan(application):
                mcp_tier3.session_manager.run():
         yield
 
-app_main.router.lifespan_context = lifespan
+all_routes = [
+    Route("/", root_info, methods=["GET"]),
+    Route("/health", health, methods=["GET"]),
+]
+if ENABLE_OAUTH:
+    all_routes.append(_root_protected_resource_route())
+
+all_routes += list(app_main.routes) + list(app_t1.routes) + list(app_t2.routes) + list(app_t3.routes)
+
+base_app = Starlette(
+    debug=True,
+    routes=all_routes,
+    lifespan=lifespan
+)
 
 
 class AcceptHeaderMiddleware:
@@ -244,7 +248,7 @@ class AcceptHeaderMiddleware:
         await self.app(scope, receive, send)
 
 
-app = AcceptHeaderMiddleware(app_main)
+app = AcceptHeaderMiddleware(base_app)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
