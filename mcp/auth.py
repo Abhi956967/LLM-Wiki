@@ -65,31 +65,35 @@ class SupabaseTokenVerifier(TokenVerifier):
 
         # 2. Universal Supabase Auth API Fallback (Verifies ANY valid OAuth / Session Token directly)
         try:
-            import httpx
-            anon_key = getattr(settings, "SUPABASE_ANON_KEY", "") or "sb_publishable_pIt3iceJ0m9fsStpt6j5ig_LO4wobG8"
-            url = f"{settings.SUPABASE_URL.rstrip('/')}/auth/v1/user"
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                res = await client.get(
+            import requests
+
+            def _check_supabase_api():
+                anon_key = getattr(settings, "SUPABASE_ANON_KEY", "") or "sb_publishable_pIt3iceJ0m9fsStpt6j5ig_LO4wobG8"
+                url = f"{settings.SUPABASE_URL.rstrip('/')}/auth/v1/user"
+                return requests.get(
                     url,
                     headers={
                         "Authorization": f"Bearer {token}",
                         "apikey": anon_key,
                     },
+                    timeout=8,
                 )
-                if res.status_code == 200:
-                    user_data = res.json()
-                    user_id = user_data.get("id") or user_data.get("sub") or ""
-                    if user_id:
-                        logger.info("MCP auth verified via Supabase Auth API: %s", user_id)
-                        return AccessToken(
-                            token=token,
-                            client_id=user_id,
-                            subject=user_id,
-                            scopes=[],
-                            claims=user_data,
-                        )
-                else:
-                    logger.warning("Supabase Auth API rejected token: status %d %s", res.status_code, res.text[:200])
+
+            res = await asyncio.to_thread(_check_supabase_api)
+            if res.status_code == 200:
+                user_data = res.json()
+                user_id = user_data.get("id") or user_data.get("sub") or ""
+                if user_id:
+                    logger.info("MCP auth verified via Supabase Auth API: %s", user_id)
+                    return AccessToken(
+                        token=token,
+                        client_id=user_id,
+                        subject=user_id,
+                        scopes=[],
+                        claims=user_data,
+                    )
+            else:
+                logger.warning("Supabase Auth API rejected token: status %d %s", res.status_code, res.text[:200])
         except Exception as e:
             logger.warning("Supabase Auth API fallback failed: %s", e)
 
